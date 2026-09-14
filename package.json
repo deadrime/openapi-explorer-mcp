@@ -1,0 +1,58 @@
+{
+  "name": "openapi-explorer-mcp",
+  "version": "0.0.1",
+  "description": "MCP server for any OpenAPI 3 spec: search endpoints, inspect request and response shapes, generate TypeScript types, and call endpoints with credentials mapped to the spec's security schemes.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "openapi-explorer-mcp": "dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/auth.d.ts",
+      "default": "./dist/auth.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke.mjs",
+    "check": "npm run typecheck && npm run build && npm run smoke",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "openapi",
+    "swagger",
+    "mcp",
+    "model-context-protocol",
+    "api-explorer",
+    "typescript-types",
+    "claude-code"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deadrime/openapi-explorer-mcp.git"
+  },
+  "homepage": "https://github.com/deadrime/openapi-explorer-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/deadrime/openapi-explorer-mcp/issues"
+  },
+  "dependencies": {
+    "@hey-api/openapi-ts": "^0.95.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Smoke Pets API", "version": "1.2.3" },
+  "servers": [{ "url": "https://api.example.com" }],
+  "components": {
+    "securitySchemes": {
+      "x-api-key": { "type": "apiKey", "in": "header", "name": "x-api-key" },
+      "bearer": { "type": "http", "scheme": "bearer" }
+    },
+    "schemas": {
+      "Pet": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string", "description": "Pet name" },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "owner": { "$ref": "#/components/schemas/Owner" }
+        }
+      },
+      "Owner": { "type": "object", "properties": { "email": { "type": "string", "format": "email" } } },
+      "PetCreate": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } }
+    }
+  },
+  "paths": {
+    "/pets": {
+      "get": {
+        "operationId": "listPets",
+        "summary": "List pets",
+        "tags": ["pets"],
+        "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer" } }],
+        "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Pet" } } } } } }
+      },
+      "post": {
+        "operationId": "createPet",
+        "summary": "Create a pet",
+        "security": [{ "bearer": [] }],
+        "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PetCreate" } } } },
+        "responses": { "201": { "description": "created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Pet" } } } } }
+      }
+    },
+    "/pets/{petId}": {
+      "delete": {
+        "operationId": "deletePet",
+        "summary": "Delete a pet",
+        "security": [{ "bearer": [] }],
+        "parameters": [{ "name": "petId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "deleted" } }
+      }
+    },
+    "/admin/stats": {
+      "get": {
+        "operationId": "adminStats",
+        "summary": "Admin stats",
+        "security": [{ "x-api-key": [] }, { "bearer": [] }],
+        "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "object", "properties": { "pets": { "type": "integer" } } } } } } }
+      }
+    }
+  }
+}
