@@ -1,75 +1,81 @@
-import { pathToFileURL } from 'node:url';
-import { ConfigError, type ExplorerConfig, schemeEnvName, schemeEnvSuffix } from './config.js';
+import { type ExplorerConfig, schemeEnvName, schemeEnvSuffix } from './config.js';
 import type { Operation, SecurityScheme } from './spec-index.js';
 
-/**
- * Per-call context passed to an auth provider.
- */
-export interface AuthContext {
-  /** Identity from the tool call, e.g. a user id; the provider decides what it means. */
-  identity?: string;
-  /** Ignore cached credentials, e.g. after a 401. */
-  force?: boolean;
-}
+/** Where a credential used by a call came from. */
+export type CredentialSource = 'call' | 'session' | 'env';
 
 /**
- * Tokens a provider minted, shown by the api_auth tool.
+ * Credentials the model supplied, resolved against the spec.
  */
-export interface AuthSession {
-  /** Who the tokens belong to. */
-  identity: string;
-  /** When the access token expires, ISO 8601. */
-  expiresAt?: string;
-  /** Access token. */
-  accessToken?: string;
-  /** Refresh token. */
-  refreshToken?: string;
+export interface SuppliedCredentials {
+  /** Values keyed by security scheme name. */
+  schemes: Map<string, string>;
+  /** Plain headers keyed by lower-cased name; only for specs that declare no security schemes. */
+  headers: Map<string, string>;
 }
-
-/**
- * Supplies credentials that can't be static, e.g. tokens minted per user.
- */
-export interface AuthProvider {
-  /** Whether the provider can supply a credential for the scheme in this context, without doing I/O. */
-  canProvide(scheme: string, context: AuthContext): boolean;
-  /** Returns the credential value for the scheme. */
-  getCredential(scheme: string, context: AuthContext): Promise<string>;
-  /** Mints or refreshes tokens for an identity; registers the api_auth tool when present. */
-  authenticate?(context: AuthContext): Promise<AuthSession>;
-}
-
-/**
- * What a provider factory receives.
- */
-export interface AuthProviderOptions {
-  /** OPENAPI_BASE_URL. */
-  baseUrl: string;
-  /** OPENAPI_TIMEOUT_MS. */
-  timeoutMs: number;
-  /** The process environment, with OPENAPI_ENV_FILE already merged in. */
-  env: NodeJS.ProcessEnv;
-}
-
-/** The default export of an OPENAPI_AUTH_MODULE. */
-export type AuthProviderFactory = (options: AuthProviderOptions) => AuthProvider | Promise<AuthProvider>;
 
 /** Which security alternative a call uses. */
 export type AuthSelection = { mode: 'anonymous'; note?: string } | { mode: 'credentials'; schemes: string[] };
 
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
 /**
- * Imports OPENAPI_AUTH_MODULE and creates its provider.
+ * An empty set of supplied credentials.
  */
-export async function loadAuthProvider(config: ExplorerConfig): Promise<AuthProvider | undefined> {
-  if (!config.authModule || !config.baseUrl) return undefined;
-  const mod = (await import(pathToFileURL(config.authModule).href)) as { default?: unknown };
-  if (typeof mod.default !== 'function') {
-    throw new ConfigError(`OPENAPI_AUTH_MODULE must default-export a factory function: ${config.authModule}`);
+export function emptyCredentials(): SuppliedCredentials {
+  return { schemes: new Map(), headers: new Map() };
+}
+
+/**
+ * Where a scheme puts its value, for humans: "header x-api-key" or "Authorization: Bearer".
+ */
+export function placement(scheme: SecurityScheme): string {
+  if (scheme.type === 'apiKey') return `${scheme.in ?? '?'} ${scheme.name ?? '?'}`;
+  if (scheme.type !== 'http') return 'Authorization: Bearer';
+  const kind = (scheme.scheme ?? '').toLowerCase();
+  if (kind === 'bearer') return 'Authorization: Bearer';
+  if (kind === 'basic') return 'Authorization: Basic';
+  return `Authorization: ${scheme.scheme ?? '?'}`;
+}
+
+/**
+ * Lists the security schemes of a spec with where each one puts its value.
+ */
+function describeSchemes(schemes: Record<string, SecurityScheme>): string {
+  const entries = Object.entries(schemes);
+  return entries.length ? entries.map(([name, scheme]) => `${name} (${placement(scheme)})`).join(', ') : 'none';
+}
+
+/**
+ * Finds the scheme a key names: the scheme name itself, or the header, query or cookie name of an apiKey scheme.
+ */
+function resolveSchemeName(key: string, schemes: Record<string, SecurityScheme>): string {
+  if (schemes[key]) return key;
+  const lower = key.toLowerCase();
+  const matches = Object.entries(schemes)
+    .filter(([name, scheme]) => name.toLowerCase() === lower || (scheme.type === 'apiKey' && scheme.name?.toLowerCase() === lower))
+    .map(([name]) => name);
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) throw new Error(`"${key}" matches several security schemes (${matches.join(', ')}); use the scheme name`);
+  throw new Error(`unknown credential "${key}"; the spec defines: ${describeSchemes(schemes)}`);
+}
+
+/**
+ * Maps the keys of supplied credentials onto the spec; for a spec without security schemes they are plain headers.
+ */
+export function resolveSupplied(input: Record<string, string>, schemes: Record<string, SecurityScheme>): SuppliedCredentials {
+  const out = emptyCredentials();
+  const hasSchemes = Object.keys(schemes).length > 0;
+  for (const [key, value] of Object.entries(input)) {
+    if (/[\r\n]/.test(value)) throw new Error(`the value of "${key}" contains a line break`);
+    if (hasSchemes) {
+      out.schemes.set(resolveSchemeName(key, schemes), value);
+      continue;
+    }
+    if (!HEADER_NAME.test(key)) throw new Error(`"${key}" is not a valid header name; the spec declares no security schemes, so keys are sent as headers`);
+    out.headers.set(key.toLowerCase(), value);
   }
-  const provider = (await (mod.default as AuthProviderFactory)({ baseUrl: config.baseUrl, timeoutMs: config.timeoutMs, env: process.env })) as Partial<AuthProvider> | undefined;
-  if (!provider || typeof provider.canProvide !== 'function' || typeof provider.getCredential !== 'function') {
-    throw new ConfigError('OPENAPI_AUTH_MODULE factory must return an object with canProvide and getCredential');
-  }
-  return provider as AuthProvider;
+  return out;
 }
 
 /**
@@ -79,22 +85,22 @@ function applyScheme(name: string, scheme: SecurityScheme, value: string, header
   switch (scheme.type) {
     case 'apiKey': {
       if (!scheme.name) throw new Error(`security scheme "${name}" has no parameter name`);
-      if (scheme.in === 'header') headers[scheme.name] = value;
+      if (scheme.in === 'header') headers[scheme.name.toLowerCase()] = value;
       else if (scheme.in === 'query') url.searchParams.set(scheme.name, value);
-      else if (scheme.in === 'cookie') headers.Cookie = [headers.Cookie, `${scheme.name}=${encodeURIComponent(value)}`].filter(Boolean).join('; ');
+      else if (scheme.in === 'cookie') headers.cookie = [headers.cookie, `${scheme.name}=${encodeURIComponent(value)}`].filter(Boolean).join('; ');
       else throw new Error(`security scheme "${name}" uses an unsupported location "${scheme.in}"`);
       return;
     }
     case 'http': {
       const kind = (scheme.scheme ?? '').toLowerCase();
-      if (kind === 'bearer') headers.Authorization = `Bearer ${value}`;
-      else if (kind === 'basic') headers.Authorization = `Basic ${value.includes(':') ? Buffer.from(value).toString('base64') : value}`;
+      if (kind === 'bearer') headers.authorization = `Bearer ${value}`;
+      else if (kind === 'basic') headers.authorization = `Basic ${value.includes(':') ? Buffer.from(value).toString('base64') : value}`;
       else throw new Error(`security scheme "${name}" uses an unsupported HTTP scheme "${scheme.scheme}"`);
       return;
     }
     case 'oauth2':
     case 'openIdConnect':
-      headers.Authorization = `Bearer ${value}`;
+      headers.authorization = `Bearer ${value}`;
       return;
     default:
       throw new Error(`security scheme "${name}" has an unsupported type "${scheme.type}"`);
@@ -102,49 +108,79 @@ function applyScheme(name: string, scheme: SecurityScheme, value: string, header
 }
 
 /**
- * Maps credentials from the environment and an auth provider onto the security schemes of the spec.
+ * Maps credentials onto the security schemes of the spec. A value passed in a call wins over one kept for the
+ * session, which wins over the environment.
  */
 export class Credentials {
-  constructor(
-    private readonly config: ExplorerConfig,
-    private readonly provider?: AuthProvider
-  ) {}
+  private readonly session = emptyCredentials();
+
+  constructor(private readonly config: ExplorerConfig) {}
+
+  /**
+   * Keeps supplied credentials in memory for the rest of the server session.
+   */
+  remember(supplied: SuppliedCredentials): void {
+    for (const [name, value] of supplied.schemes) this.session.schemes.set(name, value);
+    for (const [name, value] of supplied.headers) this.session.headers.set(name, value);
+  }
+
+  /**
+   * Forgets session credentials by key, or all of them for "*"; returns the names that were kept before.
+   */
+  forget(keys: string[], schemes: Record<string, SecurityScheme>): string[] {
+    const kept = [...this.session.schemes.keys(), ...this.session.headers.keys()];
+    if (keys.includes('*')) {
+      this.session.schemes.clear();
+      this.session.headers.clear();
+      return kept;
+    }
+    const hasSchemes = Object.keys(schemes).length > 0;
+    const names = keys.map((key) => (hasSchemes ? resolveSchemeName(key, schemes) : key.toLowerCase()));
+    for (const name of names) {
+      this.session.schemes.delete(name);
+      this.session.headers.delete(name);
+    }
+    return kept.filter((name) => names.includes(name));
+  }
 
   /**
    * Where the credential of a scheme comes from, or null when nothing supplies it.
    */
-  source(scheme: string, context: AuthContext = {}): 'env' | 'module' | null {
+  source(scheme: string, call: SuppliedCredentials = emptyCredentials()): CredentialSource | null {
+    if (call.schemes.has(scheme)) return 'call';
+    if (this.session.schemes.has(scheme)) return 'session';
     if (this.config.schemeCredentials.has(schemeEnvSuffix(scheme))) return 'env';
-    return this.provider?.canProvide(scheme, context) ? 'module' : null;
+    return null;
   }
 
   /**
-   * Credential status of a scheme for spec info.
+   * Credential status of a scheme outside a call: its source, or "not configured".
    */
   describe(scheme: string): string {
-    const source = this.source(scheme);
-    if (source) return source;
-    // canProvide does no I/O by contract, so probing with a placeholder identity is safe and tells whether passing one would help.
-    return this.provider?.canProvide(scheme, { identity: 'identity' }) ? 'module, when an identity is passed' : 'not configured';
+    return this.source(scheme) ?? 'not configured';
+  }
+
+  /**
+   * Names of plain headers kept for the session.
+   */
+  sessionHeaders(): string[] {
+    return [...this.session.headers.keys()];
   }
 
   /**
    * Picks the security alternative for a call: a forced scheme, the first alternative with all credentials, or anonymous.
    */
-  select(op: Operation, as: string, context: AuthContext, schemes: Record<string, SecurityScheme>): AuthSelection {
+  select(op: Operation, as: string, call: SuppliedCredentials, schemes: Record<string, SecurityScheme>): AuthSelection {
     if (as === 'anonymous') return { mode: 'anonymous' };
 
     if (as !== 'auto') {
-      if (!schemes[as]) {
-        const known = Object.keys(schemes);
-        throw new Error(`unknown security scheme "${as}"; the spec defines: ${known.length ? known.join(', ') : 'none'}`);
-      }
-      if (!this.source(as, context)) throw new Error(`no credential for "${as}": ${this.hint(as)}`);
+      if (!schemes[as]) throw new Error(`unknown security scheme "${as}"; the spec defines: ${describeSchemes(schemes)}`);
+      if (!this.source(as, call)) throw new Error(`no credential for "${as}": ${this.hint(as)}`);
       return { mode: 'credentials', schemes: [as] };
     }
 
     for (const alternative of op.security) {
-      if (alternative.every((scheme) => this.source(scheme, context))) {
+      if (alternative.every((scheme) => this.source(scheme, call))) {
         return alternative.length ? { mode: 'credentials', schemes: alternative } : { mode: 'anonymous' };
       }
     }
@@ -158,36 +194,32 @@ export class Credentials {
   }
 
   /**
-   * Puts the credentials of the selected schemes into the request; reports whether any came from the provider.
+   * Puts the selected credentials and plain headers into the request; returns what was used, without values.
    */
-  async apply(
-    selection: AuthSelection,
-    schemes: Record<string, SecurityScheme>,
-    context: AuthContext,
-    headers: Record<string, string>,
-    url: URL
-  ): Promise<{ fromProvider: boolean }> {
-    if (selection.mode === 'anonymous') return { fromProvider: false };
-
-    let fromProvider = false;
-    for (const name of selection.schemes) {
-      const scheme = schemes[name];
-      if (!scheme) throw new Error(`the spec has no security scheme "${name}"`);
-      let value = this.config.schemeCredentials.get(schemeEnvSuffix(name));
-      if (value === undefined) {
-        if (!this.provider) throw new Error(`no credential for "${name}": ${this.hint(name)}`);
-        value = await this.provider.getCredential(name, context);
-        fromProvider = true;
+  apply(selection: AuthSelection, schemes: Record<string, SecurityScheme>, call: SuppliedCredentials, headers: Record<string, string>, url: URL): string {
+    const used: string[] = [];
+    if (selection.mode === 'credentials') {
+      for (const name of selection.schemes) {
+        const scheme = schemes[name];
+        if (!scheme) throw new Error(`the spec has no security scheme "${name}"`);
+        const source = this.source(name, call);
+        const value = call.schemes.get(name) ?? this.session.schemes.get(name) ?? this.config.schemeCredentials.get(schemeEnvSuffix(name));
+        if (!source || value === undefined) throw new Error(`no credential for "${name}": ${this.hint(name)}`);
+        applyScheme(name, scheme, value, headers, url);
+        used.push(`${name} (${source})`);
       }
-      applyScheme(name, scheme, value, headers, url);
     }
-    return { fromProvider };
+    for (const [name, value] of new Map([...this.session.headers, ...call.headers])) {
+      headers[name] = value;
+      used.push(`header ${name} (${call.headers.has(name) ? 'call' : 'session'})`);
+    }
+    return used.length ? used.join(' + ') : 'anonymous';
   }
 
   /**
-   * Tells the user how to supply a credential for a scheme.
+   * Tells how to supply a credential for a scheme.
    */
   private hint(scheme: string): string {
-    return `set ${schemeEnvName(scheme)}${this.provider ? ' or pass an identity the auth module accepts' : ''}`;
+    return `pass credentials: { "${scheme}": "…" }, keep one with api_credentials, or set ${schemeEnvName(scheme)}`;
   }
 }

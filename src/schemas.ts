@@ -10,8 +10,14 @@ const renderMode = z.enum(['outline', 'json']).default('outline').describe('outl
 const as = z
   .string()
   .default('auto')
-  .describe("'auto' uses the first security alternative with configured credentials; 'anonymous' sends none; or a security scheme name from the spec");
-const identity = z.string().optional().describe('Identity passed to the auth module, e.g. a user id');
+  .describe("'auto' uses the first security alternative that has credentials; 'anonymous' sends none; or a security scheme name from the spec");
+const credentialMap = z.record(z.string(), z.string().min(1));
+const credentials = credentialMap
+  .optional()
+  .describe(
+    'Credentials for this call only, keyed by security scheme name from api_spec_info; an apiKey scheme also accepts its header name. ' +
+      'They win over api_credentials and the environment. When the spec declares no security schemes, keys are sent as headers'
+  );
 const pathParams = z.record(z.string(), z.union([z.string(), z.number()])).default({}).describe('Path parameters');
 const query = z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({}).describe('Query-string parameters');
 
@@ -43,7 +49,7 @@ export const typesInput = {
   name_prefix: z.string().default('').describe('Prefix for generated type names'),
 };
 
-export const getInput = { endpoint, path_params: pathParams, query, as, identity };
+export const getInput = { endpoint, path_params: pathParams, query, as, credentials };
 
 export const requestInput = {
   method,
@@ -52,15 +58,14 @@ export const requestInput = {
   query,
   body: z.unknown().optional().describe('JSON body'),
   as,
-  identity,
+  credentials,
   reason: z.string().optional().describe('Note for the call journal: why the call was made'),
   confirm_danger: z.boolean().default(false).describe('Required for operations classified as destructive'),
 };
 
-export const authInput = {
-  identity,
-  refresh: z.boolean().default(false).describe('Mint new tokens even if cached ones are still valid'),
-  show_token: z.boolean().default(false).describe('Return full tokens instead of previews'),
+export const credentialsInput = {
+  set: credentialMap.default({}).describe('Credentials to keep for this server session, keyed like `credentials` in api_get'),
+  clear: z.array(z.string()).default([]).describe('Keys to forget; ["*"] forgets everything kept in this session'),
 };
 
 export const callLogInput = {

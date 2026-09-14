@@ -33,8 +33,6 @@ export interface ExplorerConfig {
   instructionsFile?: string;
   /** JSONL journal of api_request calls. */
   callLog: string;
-  /** ES module whose default export creates an auth provider. */
-  authModule?: string;
   /** Headers sent with every call, from OPENAPI_HEADER_<NAME>. */
   staticHeaders: Record<string, string>;
   /** Credentials keyed by the normalized scheme name, from OPENAPI_AUTH_<SCHEME>. */
@@ -50,7 +48,6 @@ export class ConfigError extends Error {
 
 const AUTH_PREFIX = 'OPENAPI_AUTH_';
 const HEADER_PREFIX = 'OPENAPI_HEADER_';
-const RESERVED_AUTH_KEYS = new Set(['OPENAPI_AUTH_MODULE']);
 
 /**
  * Normalizes a security scheme name into its environment variable suffix: x-admin-token becomes X_ADMIN_TOKEN.
@@ -165,13 +162,12 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ExplorerConfig
     if (!value) continue;
     if (key.startsWith(HEADER_PREFIX)) {
       staticHeaders[key.slice(HEADER_PREFIX.length).toLowerCase().replace(/_/g, '-')] = value;
-    } else if (key.startsWith(AUTH_PREFIX) && !RESERVED_AUTH_KEYS.has(key)) {
+    } else if (key.startsWith(AUTH_PREFIX)) {
       schemeCredentials.set(key.slice(AUTH_PREFIX.length), value);
     }
   }
-  const authModule = optionalPath(env, 'OPENAPI_AUTH_MODULE');
 
-  if (!baseUrl && (schemeCredentials.size > 0 || Object.keys(staticHeaders).length > 0 || authModule)) {
+  if (!baseUrl && (schemeCredentials.size > 0 || Object.keys(staticHeaders).length > 0)) {
     throw new ConfigError(
       'OPENAPI_BASE_URL is required when credentials or headers are configured: they only go to an origin you set explicitly, never to one taken from the spec'
     );
@@ -197,7 +193,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ExplorerConfig
     recipesDir: optionalPath(env, 'OPENAPI_RECIPES_DIR'),
     instructionsFile: optionalPath(env, 'OPENAPI_INSTRUCTIONS_FILE'),
     callLog: rawCallLog ? path.resolve(expandHome(rawCallLog)) : path.join(cacheDir, 'calls.jsonl'),
-    authModule,
     staticHeaders,
     schemeCredentials,
   };

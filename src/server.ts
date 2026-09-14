@@ -4,7 +4,7 @@ import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { type AuthContext, type AuthProvider, Credentials, loadAuthProvider } from './auth.js';
+import { Credentials, emptyCredentials, placement, resolveSupplied } from './auth.js';
 import { type ExplorerConfig, readConfig, schemeEnvName } from './config.js';
 import { buildUrl, type CallResult, send } from './http.js';
 import { appendJsonl, tailJsonl } from './journal.js';
@@ -13,7 +13,7 @@ import { listRecipes } from './recipes.js';
 import { type DangerRules, loadDangerRules } from './risk.js';
 import { renderOutline, resolveJson, type SchemaSpec } from './schema-view.js';
 import * as schemas from './schemas.js';
-import type { HttpMethod, Operation, SchemaNode } from './spec-index.js';
+import type { HttpMethod, Operation, SchemaNode, SecurityScheme } from './spec-index.js';
 import { SpecStore, type SpecState } from './spec-store.js';
 import { getTypeMap, renameDeclaration } from './types-gen.js';
 
@@ -28,7 +28,7 @@ const BASE_INSTRUCTIONS = [
   '',
   '- Refer to endpoints as "METHOD /path"; operationIds are not always unique.',
   '- Summaries can be missing or wrong — check the path, method and response shape.',
-  '- Authentication follows the security schemes of the spec. api_spec_info shows which schemes have credentials; `as` picks one explicitly.',
+  '- Authentication follows the security schemes of the spec. api_spec_info shows which schemes have credentials. Pass `credentials` for one call or keep them with api_credentials; `as` picks a scheme explicitly.',
   '- Destructive endpoints need confirm_danger: true in api_request.',
 ].join('\n');
 
@@ -41,7 +41,7 @@ interface CallArgs {
   query: Record<string, string | number | boolean>;
   body?: unknown;
   as: string;
-  identity?: string;
+  credentials?: Record<string, string>;
 }
 
 /**
@@ -55,11 +55,10 @@ export class OpenApiExplorerServer {
   constructor(
     private readonly config: ExplorerConfig,
     rules: DangerRules,
-    private readonly provider: AuthProvider | undefined,
     extraInstructions: string
   ) {
     this.store = new SpecStore(config, rules);
-    this.credentials = new Credentials(config, provider);
+    this.credentials = new Credentials(config);
     const instructions = extraInstructions ? `${BASE_INSTRUCTIONS}\n\n${extraInstructions}` : BASE_INSTRUCTIONS;
     this.server = new McpServer({ name: config.serverName, version: VERSION }, { capabilities: { tools: {} }, instructions });
     this.registerTools();
@@ -72,9 +71,8 @@ export class OpenApiExplorerServer {
     try {
       const config = readConfig();
       const rules = loadDangerRules(config.dangerFile);
-      const provider = await loadAuthProvider(config);
       const extra = config.instructionsFile ? readFileSync(config.instructionsFile, 'utf8').trim() : '';
-      return new OpenApiExplorerServer(config, rules, provider, extra);
+      return new OpenApiExplorerServer(config, rules, extra);
     } catch (error) {
       // stdout carries JSON-RPC, so startup errors go to stderr.
       process.stderr.write(`openapi-explorer-mcp: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -137,28 +135,48 @@ export class OpenApiExplorerServer {
   }
 
   /**
-   * Calls an operation: picks credentials, checks the origin, retries once on 401 with fresh provider tokens.
+   * Base URL for calls, or null when there is none; for reports that must not fail.
+   */
+  private baseUrlOrNull(state: SpecState): string | null {
+    try {
+      return this.baseUrl(state);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Security schemes with where each puts its value and where its credential comes from — never the value.
+   */
+  private schemeStatus(schemes: Record<string, SecurityScheme>): Array<Record<string, string>> {
+    return Object.entries(schemes).map(([name, scheme]) => ({
+      name,
+      type: scheme.type,
+      placement: placement(scheme),
+      credential: this.credentials.describe(name),
+      env: schemeEnvName(name),
+    }));
+  }
+
+  /**
+   * Calls an operation: resolves and picks credentials, checks the origin, explains a 401 and a 404.
    */
   private async performCall(state: SpecState, op: Operation, args: CallArgs): Promise<CallResult & { auth: string; note?: Record<string, string> }> {
     const base = this.baseUrl(state);
     const origin = new URL(base).origin;
-    const context: AuthContext = { identity: args.identity };
     const schemes = state.index.securitySchemes;
-    const selection = this.credentials.select(op, args.as, context, schemes);
+    const call = args.credentials ? resolveSupplied(args.credentials, schemes) : emptyCredentials();
+    const selection = this.credentials.select(op, args.as, call, schemes);
 
-    const attempt = async (force: boolean) => {
-      const url = buildUrl(base, op.path, args.pathParams, args.query);
-      const headers: Record<string, string> = { ...this.config.staticHeaders };
-      const applied = await this.credentials.apply(selection, schemes, { ...context, force }, headers, url);
-      if (url.origin !== origin) throw new Error(`refusing to send the request to ${url.origin}; only ${origin} is allowed`);
-      return { result: await send(args.method, url, headers, args.body, this.config.timeoutMs), applied };
-    };
-
-    let { result, applied } = await attempt(false);
-    if (result.status === 401 && applied.fromProvider) ({ result, applied } = await attempt(true));
+    const url = buildUrl(base, op.path, args.pathParams, args.query);
+    const headers: Record<string, string> = { ...this.config.staticHeaders };
+    const auth = this.credentials.apply(selection, schemes, call, headers, url);
+    if (url.origin !== origin) throw new Error(`refusing to send the request to ${url.origin}; only ${origin} is allowed`);
+    const result = await send(args.method, url, headers, args.body, this.config.timeoutMs);
 
     const note: Record<string, string> = {};
     if (selection.mode === 'anonymous' && selection.note) note.auth = selection.note;
+    else if (result.status === 401 && auth !== 'anonymous') note.auth = `the API rejected ${auth}: the credential is wrong or expired — supply a fresh one`;
     if (result.status === 404) {
       const fresh = await this.store.forceRevalidate().catch(() => null);
       note.specRecheck = fresh?.index.byKey.has(op.key)
@@ -167,14 +185,14 @@ export class OpenApiExplorerServer {
     }
 
     return {
-      auth: selection.mode === 'anonymous' ? 'anonymous' : selection.schemes.join(' + '),
+      auth,
       ...result,
       ...(Object.keys(note).length ? { note } : {}),
     };
   }
 
   /**
-   * Registers every tool; api_request, api_auth and recipe only when configured.
+   * Registers every tool; api_request and recipe only when configured.
    */
   private registerTools(): void {
     this.server.registerTool(
@@ -198,15 +216,7 @@ export class OpenApiExplorerServer {
             baseUrl: this.config.baseUrl ?? state.index.servers[0] ?? null,
             counts: state.index.counts,
             groups,
-            securitySchemes: Object.entries(state.index.securitySchemes).map(([name, scheme]) => ({
-              name,
-              type: scheme.type,
-              ...(scheme.in ? { in: scheme.in } : {}),
-              ...(scheme.name ? { parameter: scheme.name } : {}),
-              ...(scheme.scheme ? { scheme: scheme.scheme } : {}),
-              credential: this.credentials.describe(name),
-              env: schemeEnvName(name),
-            })),
+            securitySchemes: this.schemeStatus(state.index.securitySchemes),
             writes: this.config.allowWrite ? 'enabled' : 'disabled (set OPENAPI_ALLOW_WRITE to register api_request)',
             ...(state.meta.changed ? { changed: state.meta.changed } : {}),
             ...(state.offline ? { offline: { since: new Date(state.offline.since).toISOString(), reason: state.offline.reason } } : {}),
@@ -406,12 +416,12 @@ export class OpenApiExplorerServer {
         inputSchema: schemas.getInput,
         annotations: { readOnlyHint: true, openWorldHint: true },
       },
-      ({ endpoint, path_params, query, as, identity }) =>
+      ({ endpoint, path_params, query, as, credentials }) =>
         this.run(async () => {
           const state = await this.store.load();
           const op = resolveEndpoint(state.index, endpoint);
           if (op.method !== 'GET') throw new Error(`${op.key} is not a GET endpoint${this.config.allowWrite ? '; use api_request' : ''}`);
-          const response = await this.performCall(state, op, { method: 'GET', pathParams: path_params, query, as, identity });
+          const response = await this.performCall(state, op, { method: 'GET', pathParams: path_params, query, as, credentials });
           return { key: op.key, ...response, ...this.specNote(state) };
         })
     );
@@ -425,7 +435,7 @@ export class OpenApiExplorerServer {
           inputSchema: schemas.requestInput,
           annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
         },
-        ({ method, endpoint, path_params, query, body, as, identity, reason, confirm_danger }) =>
+        ({ method, endpoint, path_params, query, body, as, credentials, reason, confirm_danger }) =>
           this.run(async () => {
             const state = await this.store.load();
             const op = resolveEndpoint(state.index, endpoint);
@@ -434,7 +444,7 @@ export class OpenApiExplorerServer {
               throw new Error(`${op.key} is destructive: ${op.dangerReason}. Repeat with confirm_danger: true if this is intended.`);
             }
 
-            const response = await this.performCall(state, op, { method, pathParams: path_params, query, body, as, identity });
+            const response = await this.performCall(state, op, { method, pathParams: path_params, query, body, as, credentials });
             const responseBody = response.body as { id?: unknown } | null;
             appendJsonl(this.config.callLog, {
               ts: new Date().toISOString(),
@@ -452,30 +462,33 @@ export class OpenApiExplorerServer {
       );
     }
 
-    const provider = this.provider;
-    if (provider?.authenticate) {
-      this.server.registerTool(
-        'api_auth',
-        {
-          title: 'Mint tokens',
-          description: 'Mints or refreshes tokens through the auth module. show_token returns full tokens instead of previews.',
-          inputSchema: schemas.authInput,
-          annotations: { readOnlyHint: true, openWorldHint: true },
-        },
-        ({ identity, refresh, show_token }) =>
-          this.run(async () => {
-            const session = await provider.authenticate!({ identity, force: refresh });
-            const preview = (token?: string) => (token ? `${token.slice(0, 12)}…(${token.length})` : undefined);
-            return {
-              identity: session.identity,
-              expiresAt: session.expiresAt,
-              accessToken: show_token ? session.accessToken : preview(session.accessToken),
-              refreshToken: show_token ? session.refreshToken : preview(session.refreshToken),
-              ...(show_token ? {} : { note: 'show_token: true returns the full tokens' }),
-            };
-          })
-      );
-    }
+    this.server.registerTool(
+      'api_credentials',
+      {
+        title: 'Session credentials',
+        description:
+          'Keeps credentials in memory for this server session or forgets them, and shows where the credential of each security scheme comes from — never the values. ' +
+          'Keys are scheme names from api_spec_info; an apiKey scheme also accepts its header name. A credential passed in a call wins over a session one, which wins over the environment.',
+        inputSchema: schemas.credentialsInput,
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      ({ set, clear }) =>
+        this.run(async () => {
+          const state = await this.store.load();
+          const schemes = state.index.securitySchemes;
+          // Resolve first, so a bad key in `set` fails before anything is forgotten.
+          const supplied = resolveSupplied(set, schemes);
+          const forgotten = clear.length ? this.credentials.forget(clear, schemes) : [];
+          this.credentials.remember(supplied);
+          const sessionHeaders = this.credentials.sessionHeaders();
+          return {
+            ...(forgotten.length ? { forgotten } : {}),
+            baseUrl: this.baseUrlOrNull(state),
+            securitySchemes: this.schemeStatus(schemes),
+            ...(sessionHeaders.length ? { sessionHeaders } : {}),
+          };
+        })
+    );
 
     this.server.registerTool(
       'api_call_log',
