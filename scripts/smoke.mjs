@@ -7,7 +7,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-const SERVER = new URL('../dist/index.js', import.meta.url).pathname;
+// OEM_SERVER points the smoke at another install, e.g. the packed tarball installed by smoke-package.mjs.
+const SERVER = process.env.OEM_SERVER ?? new URL('../dist/index.js', import.meta.url).pathname;
 const SPEC = new URL('./fixtures/pets.json', import.meta.url).pathname;
 const SECRET = 'smoke-secret-value-7f3a';
 const CACHE = mkdtempSync(path.join(tmpdir(), 'openapi-explorer-smoke-'));

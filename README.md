@@ -132,7 +132,12 @@ npm run typecheck
 npm run build      # tsc into dist/
 npm run smoke      # stdio checks against scripts/fixtures/pets.json, no network
 npm run check      # all three
+npm run smoke:package  # packs the tarball, installs it in a clean directory and runs the smoke there
 ```
+
+`npm publish` runs `check` and `smoke:package` first. The package depends on TypeScript 5.9 directly: the type
+generator declares TypeScript as a peer dependency, and without the pin npm installs TypeScript 7, whose JavaScript
+API the generator can't use.
 
 ## License
 

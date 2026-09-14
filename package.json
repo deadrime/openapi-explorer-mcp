@@ -1,6 +1,6 @@
 {
   "name": "openapi-explorer-mcp",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "MCP server for any OpenAPI 3 spec: search endpoints, inspect request and response shapes, generate TypeScript types, and call endpoints with credentials mapped to the spec's security schemes.",
   "license": "MIT",
   "author": "Eugene Trofimov",
@@ -27,7 +27,9 @@
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "typecheck": "tsc --noEmit",
     "smoke": "node scripts/smoke.mjs",
+    "smoke:package": "node scripts/smoke-package.mjs",
     "check": "npm run typecheck && npm run build && npm run smoke",
+    "prepublishOnly": "npm run check && npm run smoke:package",
     "prepack": "npm run build"
   },
   "keywords": [
@@ -50,10 +52,10 @@
   "dependencies": {
     "@hey-api/openapi-ts": "^0.95.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "typescript": "~5.9.3",
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/node": "^20.19.43",
-    "typescript": "^5.9.3"
+    "@types/node": "^20.19.43"
   }
 }
