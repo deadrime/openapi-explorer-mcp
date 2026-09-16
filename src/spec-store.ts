@@ -48,6 +48,8 @@ export interface SpecState {
   specPath: string;
 }
 
+const OFFLINE_RETRY_MS = 30_000;
+
 /**
  * Parses spec text and checks that it is OpenAPI 3.
  */
@@ -74,10 +76,24 @@ function diffKeys(before: SpecIndex, after: SpecIndex): KeyDiff {
 }
 
 /**
- * Loads the spec lazily: a local file is re-read when modified, a URL is cached on disk and revalidated with ETag.
+ * A one-line notice about a spec that changed between two loads, or null when nothing an agent cares about changed.
+ */
+function changeNotice(before: SpecState, after: SpecIndex, version: string | undefined, diff: KeyDiff): string | null {
+  const versionChanged = before.meta.version !== version;
+  if (!versionChanged && diff.added.length === 0 && diff.removed.length === 0) return null;
+  const versions = versionChanged ? `${before.meta.version ?? '?'} → ${version ?? '?'}, ` : '';
+  return `the spec was updated: ${versions}+${diff.added.length} −${diff.removed.length} of ${after.operations.length} operations (api_spec_info lists them)`;
+}
+
+/**
+ * Loads the spec lazily: a local file is re-read when modified; a URL spec is served from memory or the disk cache at
+ * once and revalidated with ETag in the background, so no call waits for the network except the very first one.
  */
 export class SpecStore {
   private state: SpecState | null = null;
+  private refreshing: Promise<SpecState> | null = null;
+  private notice: string | null = null;
+  private lastAttempt = 0;
   private readonly cachedSpecPath: string;
   private readonly metaPath: string;
 
@@ -90,10 +106,16 @@ export class SpecStore {
   }
 
   /**
-   * Returns the current spec, revalidating it when due.
+   * Returns the current spec; with force, waits for a revalidation.
    */
   async load(force = false): Promise<SpecState> {
-    return this.config.specIsUrl ? this.loadUrl(force) : this.loadFile(force);
+    if (!this.config.specIsUrl) return this.loadFile(force);
+    if (force) return this.revalidate();
+    this.state ??= this.readDisk();
+    // Nothing to serve yet: the first load has to wait for the network.
+    if (!this.state) return this.revalidate();
+    if (this.due(this.state)) this.revalidate().catch(() => undefined);
+    return this.state;
   }
 
   /**
@@ -101,6 +123,34 @@ export class SpecStore {
    */
   forceRevalidate(): Promise<SpecState> {
     return this.load(true);
+  }
+
+  /**
+   * Returns the pending notice about a changed spec once, then forgets it.
+   */
+  takeNotice(): string | null {
+    const notice = this.notice;
+    this.notice = null;
+    return notice;
+  }
+
+  /**
+   * Whether a background revalidation is due: after the TTL, or every 30 seconds while the source is unreachable.
+   */
+  private due(state: SpecState): boolean {
+    if (this.refreshing) return false;
+    const now = Date.now();
+    return state.offline ? now - this.lastAttempt >= OFFLINE_RETRY_MS : now - state.meta.checkedAt >= this.config.specTtlMs;
+  }
+
+  /**
+   * Runs one revalidation at a time; concurrent callers share it.
+   */
+  private revalidate(): Promise<SpecState> {
+    this.refreshing ??= this.fetchSpec().finally(() => {
+      this.refreshing = null;
+    });
+    return this.refreshing;
   }
 
   /**
@@ -113,17 +163,17 @@ export class SpecStore {
     const text = readFileSync(this.config.specSource, 'utf8');
     const index = buildIndex(parseSpec(text, this.config.specSource), this.rules);
     const meta: SpecMeta = { source: this.config.specSource, etag: null, fetchedAt: mtimeMs, checkedAt: Date.now(), version: index.version, size: text.length };
-    if (this.state?.meta.version && this.state.meta.version !== meta.version) meta.changed = diffKeys(this.state.index, index);
+    if (this.state) this.recordChange(this.state, index, meta);
     this.state = { index, meta, offline: null, specPath: this.config.specSource };
     return this.state;
   }
 
   /**
-   * Loads a URL spec: memory, then disk cache, then a conditional fetch; serves the cache when the source is down.
+   * Fetches the URL spec conditionally; serves the cache when the source is down.
    */
-  private async loadUrl(force: boolean): Promise<SpecState> {
+  private async fetchSpec(): Promise<SpecState> {
     const now = Date.now();
-    if (!force && this.state && !this.state.offline && now - this.state.meta.checkedAt < this.config.specTtlMs) return this.state;
+    this.lastAttempt = now;
     this.state ??= this.readDisk();
 
     try {
@@ -146,7 +196,7 @@ export class SpecStore {
           version: index.version,
           size: text.length,
         };
-        if (this.state?.meta.version && this.state.meta.version !== meta.version) meta.changed = diffKeys(this.state.index, index);
+        if (this.state) this.recordChange(this.state, index, meta);
         this.writeDisk(text, meta);
         this.state = { index, meta, offline: null, specPath: this.cachedSpecPath };
       } else {
@@ -159,6 +209,21 @@ export class SpecStore {
     }
 
     return this.state;
+  }
+
+  /**
+   * Stores the operations that changed in the new meta and queues a notice for the next tool response.
+   */
+  private recordChange(before: SpecState, index: SpecIndex, meta: SpecMeta): void {
+    const diff = diffKeys(before.index, index);
+    const notice = changeNotice(before, index, meta.version, diff);
+    if (!notice) {
+      // Same operations as before: the last known change stays on record.
+      if (before.meta.changed) meta.changed = before.meta.changed;
+      return;
+    }
+    meta.changed = diff;
+    this.notice = notice;
   }
 
   /**

@@ -12,14 +12,31 @@
         "type": "object",
         "required": ["id", "name"],
         "properties": {
-          "id": { "type": "string" },
+          "id": { "type": "string", "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$" },
           "name": { "type": "string", "description": "Pet name" },
           "tags": { "type": "array", "items": { "type": "string" } },
-          "owner": { "$ref": "#/components/schemas/Owner" }
+          "owner": { "$ref": "#/components/schemas/Owner" },
+          "status": { "type": "string", "enum": ["available", "sold"], "nullable": true, "description": "Sale status; null while the pet is not listed" },
+          "kind": { "type": "string", "enum": ["k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10", "k11", "k12"] },
+          "bornAt": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$" },
+          "notes": {
+            "type": "string",
+            "description": "Free-form notes about the pet written by the shelter staff when it arrives, including temperament, feeding habits, known allergies, vaccination history and anything else a future owner should know before adoption"
+          },
+          "category": { "$ref": "#/components/schemas/Category" }
         }
       },
-      "Owner": { "type": "object", "properties": { "email": { "type": "string", "format": "email" } } },
-      "PetCreate": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } }
+      "Owner": { "type": "object", "properties": { "email": { "type": "string", "format": "email", "description": "Contact email" } } },
+      "Category": {
+        "type": "object",
+        "description": "Pet category; categories nest",
+        "properties": {
+          "name": { "type": "string" },
+          "parent": { "$ref": "#/components/schemas/Category" }
+        }
+      },
+      "PetCreate": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } },
+      "Problem": { "type": "object", "properties": { "error": { "type": "string" } } }
     }
   },
   "paths": {
@@ -27,9 +44,17 @@
       "get": {
         "operationId": "listPets",
         "summary": "List pets",
+        "description": "Pets in the shelter, newest first. Sold pets stay in the list for a week after the sale.",
         "tags": ["pets"],
-        "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer" } }],
-        "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Pet" } } } } } }
+        "parameters": [
+          { "name": "limit", "in": "query", "description": "Page size", "schema": { "type": "integer", "default": 20, "maximum": 100 } },
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["available", "sold"] } }
+        ],
+        "responses": {
+          "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Pet" } } } } },
+          "400": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Problem" } } } },
+          "401": { "description": "Unauthorized" }
+        }
       },
       "post": {
         "operationId": "createPet",

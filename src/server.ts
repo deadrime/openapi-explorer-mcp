@@ -8,27 +8,36 @@ import { Credentials, emptyCredentials, placement, resolveSupplied } from './aut
 import { type ExplorerConfig, readConfig, schemeEnvName } from './config.js';
 import { buildUrl, type CallResult, send } from './http.js';
 import { appendJsonl, tailJsonl } from './journal.js';
-import { componentRef, operationTypeName, paramSummary, renderParams, resolveEndpoint } from './operations.js';
+import { renderEndpoint } from './format/endpoint.js';
+import { compactJson, omitEmpty } from './format/json.js';
+import { renderSchema } from './format/schema.js';
+import { endpointLine, listHeader, schemaLine } from './format/search.js';
+import { formatDeclaration, stripDocs } from './format/types.js';
+import { componentRef, exactOperation, operationTypeName, renderParams, resolveEndpoint } from './operations.js';
 import { listRecipes } from './recipes.js';
+import { capArrays, project } from './projection.js';
 import { type DangerRules, loadDangerRules } from './risk.js';
 import { renderOutline, resolveJson, type SchemaSpec } from './schema-view.js';
 import * as schemas from './schemas.js';
+import { type EndpointHit, SearchIndex } from './search/search-index.js';
 import type { HttpMethod, Operation, SchemaNode, SecurityScheme } from './spec-index.js';
 import { SpecStore, type SpecState } from './spec-store.js';
-import { getTypeMap, renameDeclaration } from './types-gen.js';
+import { getTypeMap, renameIdentifiers } from './types-gen.js';
 
 const VERSION = (createRequire(import.meta.url)('../package.json') as { version: string }).version;
 const READ_ONLY = { readOnlyHint: true } as const;
-const DANGER_ORDER = { safe: 0, write: 1, destructive: 2 } as const;
+const AUTO_CAPS = [20, 5, 1];
+const CALL_HINT = 'fields, max_items or query parameters';
 
 const BASE_INSTRUCTIONS = [
   'An index of an OpenAPI spec with tools to inspect and call its endpoints.',
   '',
-  'Order: api_search finds an endpoint → api_endpoint shows parameters and shapes → api_types gives TypeScript types → api_get / api_request call it.',
+  'Order: api_search finds an endpoint → api_endpoint shows parameters, shapes and errors → api_types gives TypeScript types → api_get / api_request call it.',
   '',
-  '- Refer to endpoints as "METHOD /path"; operationIds are not always unique.',
-  '- Summaries can be missing or wrong — check the path, method and response shape.',
-  '- Authentication follows the security schemes of the spec. api_spec_info shows which schemes have credentials. Pass `credentials` for one call or keep them with api_credentials; `as` picks a scheme explicitly.',
+  '- api_search ranks results and understands phrases, identifiers and field names; English words from paths and summaries work best. scope: "schemas" finds schemas by a field.',
+  '- Refer to endpoints as "METHOD /path"; operationIds are not always unique. Summaries can be missing or wrong — check the path, method and response shape.',
+  '- Credentials follow the security schemes of the spec: `credentials` for one call, api_credentials for the session, OPENAPI_AUTH_<SCHEME> for good; that is also the order of precedence. Keys are scheme names; an apiKey scheme also takes its header name; a spec without schemes gets them as headers. `as` picks a scheme.',
+  '- Narrow large responses with `fields` and `max_items`.',
   '- Destructive endpoints need confirm_danger: true in api_request.',
 ].join('\n');
 
@@ -88,21 +97,21 @@ export class OpenApiExplorerServer {
   }
 
   /**
-   * Serializes a tool result, cutting responses that would flood the context.
+   * Serializes a tool result as text or compact JSON, cutting responses that would flood the context.
    */
-  private result(value: unknown): CallToolResult {
-    const text = typeof value === 'string' ? value : (JSON.stringify(value, null, 2) ?? '');
+  private result(value: unknown, hint: string): CallToolResult {
+    const text = typeof value === 'string' ? value : compactJson(value);
     const limit = this.config.maxResponseChars;
-    const capped = text.length <= limit ? text : `${text.slice(0, limit)}\n\n… response truncated (${text.length} characters). Narrow it down: a smaller depth, a specific endpoint, or query parameters.`;
+    const capped = text.length <= limit ? text : `${text.slice(0, limit)}\n\n… response truncated (${text.length} characters). Narrow it down: ${hint}.`;
     return { content: [{ type: 'text', text: capped }] };
   }
 
   /**
    * Runs a handler and turns a thrown error into a tool error instead of a protocol error.
    */
-  private async run(handler: () => Promise<unknown>): Promise<CallToolResult> {
+  private async run(handler: () => Promise<unknown>, hint = 'a narrower query'): Promise<CallToolResult> {
     try {
-      return this.result(await handler());
+      return this.result(await handler(), hint);
     } catch (error) {
       return { content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }], isError: true };
     }
@@ -116,7 +125,9 @@ export class OpenApiExplorerServer {
     if (state.offline) {
       note.warning = `the spec source is unreachable (${state.offline.reason}); serving the cached copy from ${new Date(state.meta.fetchedAt).toISOString()}, version ${state.meta.version}`;
     }
-    if (state.meta.changed) note.changed = state.meta.changed;
+    // A change is announced once; api_spec_info keeps the full list.
+    const updated = this.store.takeNotice();
+    if (updated) note.updated = updated;
     const ageHours = (Date.now() - state.meta.fetchedAt) / 3.6e6;
     if (this.config.specIsUrl && !state.offline && ageHours > 24) note.stale = `the spec was fetched ${ageHours.toFixed(0)} h ago`;
     return Object.keys(note).length ? { spec: note } : {};
@@ -143,6 +154,35 @@ export class OpenApiExplorerServer {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The spec note as one line of text, or an empty string.
+   */
+  private specText(state: SpecState): string {
+    const note = this.specNote(state).spec as Record<string, unknown> | undefined;
+    if (!note) return '';
+    const parts: string[] = [];
+    if (typeof note.warning === 'string') parts.push(note.warning);
+    if (typeof note.stale === 'string') parts.push(note.stale);
+    if (typeof note.updated === 'string') parts.push(note.updated);
+    return parts.length ? `spec: ${parts.join('; ')}` : '';
+  }
+
+  /**
+   * An empty search result that says how to search differently; not an error.
+   */
+  private nothingFound(text: string, search: SearchIndex, filters: string[], note: string, scope: 'endpoints' | 'schemas'): string {
+    const similar = text ? search.suggest(text) : [];
+    const other = scope === 'schemas' ? 'the endpoints scope for paths and summaries' : 'scope: "schemas" for a field or schema name';
+    return [
+      `nothing matched${text ? ` "${text}"` : ''}${filters.length ? ` with ${filters.join(', ')}` : ''}.`,
+      `Try fewer words, English words from the spec, ${other}, or api_spec_info for the groups.`,
+      similar.length ? `similar words in the spec: ${similar.join(', ')}` : '',
+      note,
+    ]
+      .filter(Boolean)
+      .join('\n');
   }
 
   /**
@@ -192,6 +232,42 @@ export class OpenApiExplorerServer {
   }
 
   /**
+   * Narrows a call result: fields first, then max_items; without max_items, arrays are capped step by step until the
+   * result fits the response limit.
+   */
+  private shapeResult(result: Record<string, unknown> & { body: unknown }, fields: string[] | undefined, maxItems: number | undefined): Record<string, unknown> {
+    let body = result.body;
+    const extra: Record<string, unknown> = {};
+    const structured = body !== null && typeof body === 'object';
+    if (fields?.length) {
+      if (structured) {
+        const projection = project(body, fields);
+        body = projection.value;
+        if (projection.missing.length) extra.missing = projection.missing;
+      } else {
+        extra.missing = fields;
+      }
+    }
+    if (maxItems !== undefined && structured) {
+      const capped = capArrays(body, maxItems);
+      body = capped.value;
+      if (Object.keys(capped.cut).length) extra.arrays = capped.cut;
+    }
+
+    const assemble = (value: unknown, more: Record<string, unknown> = {}) => ({ ...omitEmpty({ ...result, ...extra, ...more, body: undefined }), body: value });
+    let shaped = assemble(body);
+    if (maxItems === undefined && structured && compactJson(shaped).length > this.config.maxResponseChars) {
+      for (const cap of AUTO_CAPS) {
+        const capped = capArrays(body, cap);
+        if (Object.keys(capped.cut).length === 0) break;
+        shaped = assemble(capped.value, { arrays: capped.cut, autoCapped: `arrays cut to ${cap} items to fit the response — narrow with fields, max_items or query parameters` });
+        if (compactJson(shaped).length <= this.config.maxResponseChars) break;
+      }
+    }
+    return shaped;
+  }
+
+  /**
    * Registers every tool; api_request and recipe only when configured.
    */
   private registerTools(): void {
@@ -199,15 +275,21 @@ export class OpenApiExplorerServer {
       'api_spec_info',
       {
         title: 'Spec info',
-        description: 'Spec version and age, counts, groups, security schemes with credential status, and changes since the previous version.',
+        description: 'Spec version and age, counts, groups, security schemes and their credentials, recent changes.',
         inputSchema: schemas.specInfoInput,
         annotations: READ_ONLY,
       },
       ({ refresh }) =>
         this.run(async () => {
           const state = refresh ? await this.store.forceRevalidate() : await this.store.load();
-          const groups: Record<string, number> = {};
-          for (const op of state.index.operations) groups[op.group] = (groups[op.group] ?? 0) + 1;
+          // This report lists the changes itself; the one-time notice is spent here.
+          this.store.takeNotice();
+          const counts = new Map<string, number>();
+          for (const op of state.index.operations) counts.set(op.group, (counts.get(op.group) ?? 0) + 1);
+          const groups = [...counts.entries()]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([group, n]) => `${group} ${n}`)
+            .join(', ');
           return {
             title: state.index.title,
             version: state.meta.version,
@@ -228,66 +310,61 @@ export class OpenApiExplorerServer {
       'api_search',
       {
         title: 'Find endpoints',
-        description:
-          'Searches method, path, operationId, summary, tags and parameter names. One line per endpoint, no schemas. ' +
-          'Admin endpoints come last. Summaries can be wrong — check the path and method.',
+        description: 'Ranked search over paths, operationIds, summaries, descriptions, parameters and body fields. One line per endpoint, or per schema with scope "schemas".',
         inputSchema: schemas.searchInput,
         annotations: READ_ONLY,
       },
-      ({ query, method, group, include_admin, has_body, limit }) =>
+      ({ query, scope, method, group, include_admin, has_body, limit }) =>
         this.run(async () => {
           const state = await this.store.load();
-          const tokens = (query ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+          const search = SearchIndex.of(state.index);
+          const text = (query ?? '').trim();
+          const note = this.specText(state);
 
-          let pool = state.index.operations;
-          if (method) pool = pool.filter((o) => o.method === method);
-          if (group) pool = pool.filter((o) => o.group === group || o.path.startsWith(`/${group}`));
-          if (!include_admin) pool = pool.filter((o) => !o.admin);
-          if (has_body !== undefined) pool = pool.filter((o) => Boolean(o.request) === has_body);
-
-          const score = (op: Operation) => {
-            const p = op.path.toLowerCase();
-            const id = (op.operationId ?? '').toLowerCase();
-            const summary = op.summary.toLowerCase();
-            return tokens.reduce((acc, t) => acc + (p.includes(t) ? 3 : 0) + (id.includes(t) ? 2 : 0) + (summary.includes(t) ? 1 : 0) + (op.searchText.includes(t) ? 1 : 0), 0);
-          };
-
-          let matched = tokens.length ? pool.filter((o) => tokens.every((t) => o.searchText.includes(t))) : pool;
-          let matchMode: 'all' | 'any' = 'all';
-          if (tokens.length && matched.length === 0) {
-            matched = pool.filter((o) => tokens.some((t) => o.searchText.includes(t)));
-            matchMode = 'any';
+          if (scope === 'schemas') {
+            const names = text ? search.schemas(text).map((hit) => ({ name: hit.name, fields: hit.fields })) : Object.keys(state.index.schemas).sort().map((name) => ({ name, fields: [] as string[] }));
+            if (names.length === 0) return this.nothingFound(text, search, [], note, scope);
+            const lines = names.slice(0, limit).map(({ name, fields }) => {
+              const schema = state.index.schemas[name] ?? {};
+              return schemaLine(name, typeof schema.description === 'string' ? schema.description : '', Object.keys(schema.properties ?? {}).length, state.index.schemaUsedBy.get(name) ?? [], fields);
+            });
+            return [`${lines.length} of ${names.length} schemas`, ...lines, note].filter(Boolean).join('\n');
           }
-          matched = [...matched].sort(
-            (a, b) => Number(a.admin) - Number(b.admin) || score(b) - score(a) || DANGER_ORDER[a.danger] - DANGER_ORDER[b.danger] || a.path.localeCompare(b.path)
-          );
 
-          const groups: Record<string, number> = {};
-          for (const op of matched) groups[op.group] = (groups[op.group] ?? 0) + 1;
+          const keep = (op: Operation) =>
+            (!method || op.method === method) &&
+            (!group || op.group === group || op.path.startsWith(`/${group}`)) &&
+            (include_admin || !op.admin) &&
+            (has_body === undefined || Boolean(op.request) === has_body);
 
-          return {
-            total: matched.length,
-            shown: Math.min(matched.length, limit),
-            ...(matchMode === 'any' ? { matched: 'any word (nothing matched all of them)' } : {}),
-            groups,
-            endpoints: matched.slice(0, limit).map((o) => ({
-              key: o.key,
-              summary: o.summary || undefined,
-              auth: o.authSchemes.length ? o.authSchemes : undefined,
-              danger: o.danger === 'safe' ? undefined : o.danger,
-              admin: o.admin || undefined,
-              params: paramSummary(o.params),
-            })),
-            ...this.specNote(state),
-          };
-        })
+          let hits: EndpointHit[];
+          if (!text) {
+            hits = state.index.operations
+              .filter(keep)
+              .sort((a, b) => Number(a.admin) - Number(b.admin) || a.path.localeCompare(b.path))
+              .map((op) => ({ op, score: 0, fields: [] }));
+          } else {
+            hits = search.endpoints(text, keep);
+            // An exact key, path or operationId goes first whatever the ranking says.
+            const exact = exactOperation(state.index, text);
+            if (exact && keep(exact)) hits = [{ op: exact, score: Number.POSITIVE_INFINITY, fields: [] }, ...hits.filter((hit) => hit.op !== exact)];
+          }
+
+          const filters = Object.entries({ method, group, include_admin: include_admin ? undefined : false, has_body })
+            .filter(([, value]) => value !== undefined)
+            .map(([name, value]) => `${name}=${value}`);
+          if (hits.length === 0) return this.nothingFound(text, search, filters, note, scope);
+          const shown = hits.slice(0, limit);
+          const lines = shown.map((hit) => endpointLine(hit.op, hit.fields));
+          return [listHeader(shown.length, hits.length, hits.map((hit) => hit.op.group)), ...lines, note].filter(Boolean).join('\n');
+        }, 'a smaller limit or more specific words')
     );
 
     this.server.registerTool(
       'api_endpoint',
       {
         title: 'Describe an endpoint',
-        description: 'Parameters, request and response shapes (compact, depth-limited), danger level, security alternatives and URL of one endpoint.',
+        description: 'One endpoint: description, danger, auth, URL, typed parameters, request and response shapes, errors.',
         inputSchema: schemas.endpointInput,
         annotations: READ_ONLY,
       },
@@ -296,43 +373,21 @@ export class OpenApiExplorerServer {
           const state = await this.store.load();
           const op = resolveEndpoint(state.index, endpoint);
           const spec: SchemaSpec = { components: { schemas: state.index.schemas } };
-          const render = (schema: SchemaNode | null | undefined) => {
-            if (!schema) return undefined;
-            if (mode === 'json') return resolveJson(spec, schema, depth);
+          const render = (schema: SchemaNode) => {
+            if (mode === 'json') return compactJson(resolveJson(spec, schema, depth));
             const outline = renderOutline(spec, schema, { depth });
-            return outline.truncated ? `${outline.text}\n// partly cut — increase depth` : outline.text;
+            return outline.truncated ? `${outline.text}\n// partly cut — increase depth or open the named schema with api_schema` : outline.text;
           };
-
-          let url: string | undefined;
-          try {
-            url = `${this.baseUrl(state)}${op.path}`;
-          } catch {
-            url = undefined;
-          }
-
-          return {
-            key: op.key,
-            operationId: op.operationId,
-            summary: op.summary || undefined,
-            group: op.group,
-            admin: op.admin || undefined,
-            danger: op.danger,
-            dangerReason: op.dangerReason,
-            auth: op.security.length ? op.security.map((alternative) => (alternative.length ? alternative.join(' + ') : 'anonymous')) : ['anonymous'],
-            url,
-            parameters: paramSummary(op.params),
-            request: render(op.request),
-            response: op.response ? { status: op.responseStatus, schema: render(op.response) } : null,
-            ...this.specNote(state),
-          };
-        })
+          const base = this.baseUrlOrNull(state);
+          return renderEndpoint({ op, url: base ? `${base}${op.path}` : undefined, render, note: this.specText(state) });
+        }, 'a smaller depth, or api_schema for one part')
     );
 
     this.server.registerTool(
       'api_schema',
       {
         title: 'Describe a schema',
-        description: 'A schema from components by name, compact and depth-limited. `path` drills into a nested field; usedBy lists the endpoints that reference it.',
+        description: 'A component schema by exact name, with the endpoints that use it.',
         inputSchema: schemas.schemaInput,
         annotations: READ_ONLY,
       },
@@ -340,10 +395,9 @@ export class OpenApiExplorerServer {
         this.run(async () => {
           const state = await this.store.load();
           if (!state.index.schemas[name]) {
-            const near = Object.keys(state.index.schemas)
-              .filter((n) => n.toLowerCase().includes(name.toLowerCase()))
-              .slice(0, 10);
-            throw new Error(`no schema "${name}"${near.length ? `; similar: ${near.join(', ')}` : ''}`);
+            const bySubstring = Object.keys(state.index.schemas).filter((n) => n.toLowerCase().includes(name.toLowerCase()));
+            const near = [...new Set([...bySubstring, ...SearchIndex.of(state.index).schemas(name).map((hit) => hit.name)])].slice(0, 8);
+            throw new Error(`no schema "${name}"${near.length ? `; similar: ${near.join(', ')}` : ''}. api_search with scope "schemas" finds schemas by a field name`);
           }
           const spec: SchemaSpec = { components: { schemas: state.index.schemas } };
           let base: SchemaNode = { $ref: `#/components/schemas/${name}` };
@@ -355,25 +409,22 @@ export class OpenApiExplorerServer {
             }
             base = node as SchemaNode;
           }
-          return {
-            name,
-            path: drill,
-            usedBy: state.index.schemaUsedBy.get(name) ?? [],
-            schema: mode === 'json' ? resolveJson(spec, base, depth) : renderOutline(spec, base, { depth }).text,
-            ...this.specNote(state),
-          };
-        })
+          const shown = drill ? base : state.index.schemas[name];
+          const body = mode === 'json' ? compactJson(resolveJson(spec, base, depth)) : renderOutline(spec, base, { depth }).text;
+          const description = typeof shown?.description === 'string' ? shown.description : '';
+          return renderSchema(drill ? `${name}.${drill}` : name, state.index.schemaUsedBy.get(name) ?? [], description, body, this.specText(state));
+        }, 'a smaller depth or a path inside the schema')
     );
 
     this.server.registerTool(
       'api_types',
       {
         title: 'TypeScript types of an endpoint',
-        description: 'Ready-to-paste TypeScript types for the request, response and parameters of an endpoint, generated from the spec with @hey-api/openapi-ts.',
+        description: 'Ready-to-paste TypeScript types of an endpoint: parameters, request, response and the types they reference.',
         inputSchema: schemas.typesInput,
         annotations: READ_ONLY,
       },
-      ({ endpoint, include, name_prefix }) =>
+      ({ endpoint, include, name_prefix, docs }) =>
         this.run(async () => {
           const state = await this.store.load();
           const op = resolveEndpoint(state.index, endpoint);
@@ -381,49 +432,62 @@ export class OpenApiExplorerServer {
           const opName = operationTypeName(name_prefix, op);
           const blocks: string[] = [];
           const names: string[] = [];
+          const emitted = new Set<string>();
 
-          const emitComponent = (node: SchemaNode | null | undefined, kind: string): string => {
+          // A component comes with every component it references, so the block compiles on its own.
+          const emitComponent = (node: SchemaNode | null | undefined, kind: 'request' | 'response'): string => {
             const ref = componentRef(node);
             if (!ref) return `// ${kind}: an unnamed schema — see its shape with api_endpoint`;
-            const declaration = typeMap.get(ref.name);
-            if (!declaration) return `// ${kind}: type ${ref.name} is missing from the generated set`;
-            const finalName = `${name_prefix}${ref.name}`;
-            names.push(finalName);
-            const renamed = renameDeclaration(declaration, ref.name, finalName);
-            return ref.array ? `${renamed}\n\nexport type ${opName}Response = ${finalName}[];` : renamed;
+            if (!typeMap.has(ref.name)) return `// ${kind}: type ${ref.name} is missing from the generated set`;
+            const parts: string[] = [];
+            for (const name of [ref.name, ...state.index.graph.closure(ref.name)]) {
+              const declaration = typeMap.get(name);
+              if (!declaration || emitted.has(name)) continue;
+              emitted.add(name);
+              names.push(`${name_prefix}${name}`);
+              parts.push(formatDeclaration(declaration, docs));
+            }
+            if (ref.array) {
+              const alias = `${opName}${kind === 'request' ? 'Body' : 'Response'}`;
+              names.push(alias);
+              parts.push(`export type ${alias} = ${ref.name}[];`);
+            }
+            return parts.join('\n\n');
           };
 
           if (include.includes('params')) {
             const params = renderParams(op, `${opName}Params`);
             if (params) {
-              blocks.push(params);
+              blocks.push(docs ? params : stripDocs(params));
               names.push(`${opName}Params`);
             }
           }
           if (include.includes('request') && op.request) blocks.push(emitComponent(op.request, 'request'));
           if (include.includes('response') && op.response) blocks.push(emitComponent(op.response, 'response'));
 
-          if (blocks.length === 0) return { key: op.key, note: 'the endpoint has no request body, response schema or parameters' };
-          return { key: op.key, names, source: '@hey-api/openapi-ts', types: blocks.join('\n\n'), ...this.specNote(state) };
-        })
+          if (blocks.length === 0) return `${op.key} has no request body, response schema or parameters`;
+          const code = renameIdentifiers(blocks.filter(Boolean).join('\n\n'), emitted, name_prefix);
+          const note = this.specText(state);
+          return [`// ${op.key}${names.length ? ` — ${names.join(', ')}` : ''}`, code, note ? `// ${note}` : ''].filter(Boolean).join('\n\n');
+        }, 'include only request, response or params')
     );
 
     this.server.registerTool(
       'api_get',
       {
         title: 'Call a GET endpoint',
-        description: 'Calls a GET endpoint and returns the response. Read-only: the method is fixed.',
+        description: 'Calls a GET endpoint.',
         inputSchema: schemas.getInput,
         annotations: { readOnlyHint: true, openWorldHint: true },
       },
-      ({ endpoint, path_params, query, as, credentials }) =>
+      ({ endpoint, path_params, query, as, credentials, fields, max_items }) =>
         this.run(async () => {
           const state = await this.store.load();
           const op = resolveEndpoint(state.index, endpoint);
           if (op.method !== 'GET') throw new Error(`${op.key} is not a GET endpoint${this.config.allowWrite ? '; use api_request' : ''}`);
           const response = await this.performCall(state, op, { method: 'GET', pathParams: path_params, query, as, credentials });
-          return { key: op.key, ...response, ...this.specNote(state) };
-        })
+          return this.shapeResult({ key: op.key, ...this.specNote(state), ...response }, fields, max_items);
+        }, CALL_HINT)
     );
 
     if (this.config.allowWrite) {
@@ -431,11 +495,11 @@ export class OpenApiExplorerServer {
         'api_request',
         {
           title: 'Call an endpoint with any method',
-          description: 'Calls an endpoint with any method, including writes. Destructive endpoints need confirm_danger: true. Calls are recorded in api_call_log.',
+          description: 'Calls an endpoint with any method; recorded in api_call_log. Destructive endpoints need confirm_danger: true.',
           inputSchema: schemas.requestInput,
           annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
         },
-        ({ method, endpoint, path_params, query, body, as, credentials, reason, confirm_danger }) =>
+        ({ method, endpoint, path_params, query, body, as, credentials, reason, confirm_danger, fields, max_items }) =>
           this.run(async () => {
             const state = await this.store.load();
             const op = resolveEndpoint(state.index, endpoint);
@@ -457,8 +521,8 @@ export class OpenApiExplorerServer {
               pathParams: path_params,
               responseIds: responseBody && typeof responseBody === 'object' && responseBody.id !== undefined ? [responseBody.id] : undefined,
             });
-            return { key: op.key, journaled: true, ...response, ...this.specNote(state) };
-          })
+            return this.shapeResult({ key: op.key, journaled: true, ...this.specNote(state), ...response }, fields, max_items);
+          }, CALL_HINT)
       );
     }
 
@@ -466,9 +530,7 @@ export class OpenApiExplorerServer {
       'api_credentials',
       {
         title: 'Session credentials',
-        description:
-          'Keeps credentials in memory for this server session or forgets them, and shows where the credential of each security scheme comes from — never the values. ' +
-          'Keys are scheme names from api_spec_info; an apiKey scheme also accepts its header name. A credential passed in a call wins over a session one, which wins over the environment.',
+        description: 'Keeps credentials for this server session or forgets them; shows where each security scheme gets its credential, never the value.',
         inputSchema: schemas.credentialsInput,
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
@@ -494,7 +556,7 @@ export class OpenApiExplorerServer {
       'api_call_log',
       {
         title: 'Call journal',
-        description: 'What api_request has called: endpoint, status and ids from responses — use it to clean up what was created.',
+        description: 'What api_request called, with ids from responses, for cleaning up.',
         inputSchema: schemas.callLogInput,
         annotations: READ_ONLY,
       },
@@ -502,7 +564,7 @@ export class OpenApiExplorerServer {
         this.run(async () => {
           const entries = tailJsonl(this.config.callLog, limit);
           return entries.length ? { file: this.config.callLog, entries } : { entries: [], note: 'the journal is empty' };
-        })
+        }, 'a smaller limit')
     );
 
     const recipesDir = this.config.recipesDir;
@@ -511,7 +573,7 @@ export class OpenApiExplorerServer {
         'recipe',
         {
           title: 'Recipes',
-          description: 'Worked scenarios for this API. Without a name, lists the recipes.',
+          description: 'Worked scenarios for this API; without a name, lists them.',
           inputSchema: schemas.recipeInput,
           annotations: READ_ONLY,
         },

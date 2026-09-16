@@ -3,6 +3,9 @@ import path from 'node:path';
 
 const cache: { key: string | null; map: Map<string, string> | null } = { key: null, map: null };
 
+// Bump when the generation input or options change, so a cached types.gen.ts from an older run is not reused.
+const GENERATOR_REVISION = 'v2';
+
 /**
  * Splits types.gen.ts into declarations by name, keeping the JSDoc right above each one.
  */
@@ -28,26 +31,50 @@ export function parseTypes(source: string): Map<string, string> {
 }
 
 /**
+ * Adds null to the values of nullable enums. OpenAPI 3.0.3 requires null to be listed for a nullable enum to accept
+ * it, and the generator follows that, while most specs only set nullable: true.
+ */
+export function patchNullableEnums(node: unknown): void {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    for (const item of node) patchNullableEnums(item);
+    return;
+  }
+  const record = node as Record<string, unknown>;
+  if (record.nullable === true && Array.isArray(record.enum) && !record.enum.includes(null)) record.enum.push(null);
+  for (const value of Object.values(record)) patchNullableEnums(value);
+}
+
+/**
  * Returns generated declarations for a spec, regenerating only when the cache key changes.
  */
 export async function getTypeMap(specPath: string, outDir: string, cacheKey: string): Promise<Map<string, string>> {
-  if (cache.key === cacheKey && cache.map) return cache.map;
+  const key = `${GENERATOR_REVISION}:${cacheKey}`;
+  if (cache.key === key && cache.map) return cache.map;
   // Loaded lazily: the generator is heavy and only this tool needs it.
   const { createClient } = await import('@hey-api/openapi-ts');
   await createClient({
     input: specPath,
     output: { path: outDir, postProcess: [] },
+    parser: { patch: { input: (spec) => patchNullableEnums(spec) } },
     plugins: ['@hey-api/typescript'],
     logs: { level: 'silent' },
   });
   cache.map = parseTypes(readFileSync(path.join(outDir, 'types.gen.ts'), 'utf8'));
-  cache.key = cacheKey;
+  cache.key = key;
   return cache.map;
 }
 
 /**
- * Renames the declared name in `export type Old = ...`.
+ * Prefixes every listed type name where it is used as an identifier; string literals and property keys stay as they are.
  */
-export function renameDeclaration(declaration: string, from: string, to: string): string {
-  return from === to ? declaration : declaration.replace(new RegExp(`(export (?:type|interface) )${from}\\b`), `$1${to}`);
+export function renameIdentifiers(declaration: string, names: Iterable<string>, prefix: string): string {
+  if (!prefix) return declaration;
+  // Not part of a longer identifier, not inside quotes, not a property key (followed by ?: or :).
+  const patterns = [...names].map((name) => [new RegExp(`(?<![\\w$'".])${name}(?![\\w$'"]|\\??:)`, 'g'), `${prefix}${name}`] as const);
+  // Odd parts of the split are comments; they keep the original words.
+  return declaration
+    .split(/(\/\*[\s\S]*?\*\/|\/\/[^\n]*)/)
+    .map((part, i) => (i % 2 ? part : patterns.reduce((code, [re, to]) => code.replace(re, to), part)))
+    .join('');
 }

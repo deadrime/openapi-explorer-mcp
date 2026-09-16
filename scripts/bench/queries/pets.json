@@ -1,0 +1,27 @@
+{
+  "env": {
+    "OPENAPI_SPEC_URL": "../../fixtures/pets.json",
+    "OPENAPI_BASE_URL": "https://api.example.com",
+    "OPENAPI_ALLOW_WRITE": "1"
+  },
+  "queries": [
+    { "q": "list pets", "expect": ["GET /pets"], "kind": "plain" },
+    { "q": "create pet", "expect": ["POST /pets"], "kind": "plain" },
+    { "q": "delete a pet", "expect": ["DELETE /pets/{petId}"], "kind": "natural" },
+    { "q": "show me all the pets", "expect": ["GET /pets"], "kind": "natural" },
+    { "q": "admin statistics", "expect": ["GET /admin/stats"], "kind": "natural" },
+    { "q": "createPet", "expect": ["POST /pets"], "kind": "ident" },
+    { "q": "adminStats", "expect": ["GET /admin/stats"], "kind": "ident" },
+    { "q": "delet pet", "expect": ["DELETE /pets/{petId}"], "kind": "typo" },
+    { "q": "owner email", "expect": ["GET /pets", "POST /pets"], "kind": "field" },
+    { "q": "petId", "expect": ["DELETE /pets/{petId}"], "kind": "field" }
+  ],
+  "calls": [
+    { "label": "spec info", "tool": "api_spec_info" },
+    { "label": "search all", "tool": "api_search", "args": {} },
+    { "label": "endpoint GET /pets", "tool": "api_endpoint", "args": { "endpoint": "GET /pets" } },
+    { "label": "endpoint POST /pets", "tool": "api_endpoint", "args": { "endpoint": "POST /pets" } },
+    { "label": "schema Pet", "tool": "api_schema", "args": { "name": "Pet" } },
+    { "label": "types GET /pets", "tool": "api_types", "args": { "endpoint": "GET /pets" } }
+  ]
+}

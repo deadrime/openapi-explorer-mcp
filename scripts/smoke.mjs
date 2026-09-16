@@ -21,14 +21,34 @@ const BASE_ENV = { OPENAPI_SPEC_URL: SPEC, OPENAPI_CACHE_DIR: CACHE };
 
 // A local API that reports which known secret arrived in which header, never the secret itself.
 const SOURCES = { [SECRET]: 'env', [CALL_SECRET]: 'call', [SESSION_SECRET]: 'session' };
+// A spec served over HTTP whose version the test can switch, with an optional delay.
+const served = { version: '1.0.0', delayMs: 0 };
+const servedSpec = () => ({
+  openapi: '3.0.3',
+  info: { title: 'Served', version: served.version },
+  paths: {
+    '/ping': { get: { operationId: 'ping', responses: { 200: { description: 'ok' } } } },
+    ...(served.version === '1.0.0' ? {} : { '/pong': { get: { operationId: 'pong', responses: { 200: { description: 'ok' } } } } }),
+  },
+});
 const api = createServer((req, res) => {
+  if (req.url === '/spec.json') {
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(servedSpec()));
+    }, served.delayMs);
+    return;
+  }
   const seen = {};
   for (const [name, value] of Object.entries(req.headers)) {
     const source = SOURCES[String(value).replace(/^Bearer /, '')];
     if (source) seen[name] = source;
   }
+  // A list to narrow: 5 items, or 50 with ?big=1.
+  const count = new URL(req.url, 'http://local').searchParams.has('big') ? 50 : 5;
+  const items = Array.from({ length: count }, (_, i) => ({ id: i + 1, name: `pet ${i + 1}`, tags: ['a', 'b', 'c'] }));
   res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ method: req.method, path: req.url, seen }));
+  res.end(JSON.stringify({ method: req.method, path: req.url, seen, items }));
 });
 await new Promise((resolve) => api.listen(0, '127.0.0.1', resolve));
 const API = `http://127.0.0.1:${api.address().port}`;
@@ -41,6 +61,8 @@ const run = (env, messages = [], timeoutMs = 60_000) =>
     const child = spawn(process.execPath, [SERVER], { env: { PATH: process.env.PATH, HOME: process.env.HOME, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
     const queue = [...messages];
     const responses = new Map();
+    const sentAt = new Map();
+    const elapsed = new Map();
     let waitingFor = null;
     let buffer = '';
     let stderr = '';
@@ -49,9 +71,16 @@ const run = (env, messages = [], timeoutMs = 60_000) =>
     const sendNext = () => {
       while (queue.length) {
         const message = queue.shift();
+        // A step of the scenario rather than a message: run an action, then pause.
+        if (message.wait !== undefined || message.act) {
+          message.act?.();
+          setTimeout(sendNext, message.wait ?? 0);
+          return;
+        }
         child.stdin.write(`${JSON.stringify(message)}\n`);
         if (message.id != null) {
           waitingFor = message.id;
+          sentAt.set(message.id, Date.now());
           return;
         }
       }
@@ -70,12 +99,13 @@ const run = (env, messages = [], timeoutMs = 60_000) =>
         if (!line) continue;
         const message = JSON.parse(line);
         responses.set(message.id, message);
+        if (sentAt.has(message.id)) elapsed.set(message.id, Date.now() - sentAt.get(message.id));
         if (message.id === waitingFor) sendNext();
       }
     });
     child.on('exit', (code) => {
       clearTimeout(timer);
-      resolve({ code, responses, stderr, stdout });
+      resolve({ code, responses, stderr, stdout, elapsed });
     });
     if (messages.length) sendNext();
     else child.stdin.end();
@@ -131,19 +161,61 @@ try {
     call(8, 'api_request', { method: 'POST', endpoint: 'POST /pets', body: { name: 'Rex' } }),
     call(9, 'api_get', { endpoint: 'GET /pets', as: 'nope' }),
     call(10, 'api_types', { endpoint: 'GET /pets' }),
+    call(11, 'api_schema', { name: 'Pet' }),
+    call(12, 'api_schema', { name: 'Category', mode: 'json', depth: 6 }),
+    call(13, 'api_schema', { name: 'Owner' }),
+    call(14, 'api_types', { endpoint: 'GET /pets', name_prefix: 'X' }),
+    call(15, 'api_search', { query: 'list all pets' }),
+    call(16, 'api_search', { query: 'owner emaill' }),
+    call(17, 'api_search', { query: 'email', scope: 'schemas' }),
+    call(18, 'api_search', { query: 'zzqx' }),
+    call(19, 'api_schema', { name: 'Categry' }),
+    call(20, 'api_endpoint', { endpoint: 'GET /pets' }),
+    call(21, 'api_types', { endpoint: 'GET /pets', docs: false }),
   ]);
 
   check('OPENAPI_ALLOW_WRITE registers api_request', toolNames(main, 2).includes('api_request'), toolNames(main, 2).join(', '));
   check('no recipe tool without OPENAPI_RECIPES_DIR', !toolNames(main, 2).includes('recipe'));
+  check('JSON results are compact', text(main, 3).length > 0 && !text(main, 3).includes('\n'), text(main, 3));
   check('spec info: version and scheme credential status', json(main, 3)?.version === '1.2.3' && credentialOf(main, 3, 'x-api-key') === 'env' && credentialOf(main, 3, 'bearer') === 'not configured', text(main, 3));
-  check('search finds GET /pets', (json(main, 4)?.endpoints ?? []).some((e) => e.key === 'GET /pets'), text(main, 4));
-  check('endpoint lists security alternatives in spec order', JSON.stringify(json(main, 5)?.auth) === JSON.stringify(['x-api-key', 'bearer']), text(main, 5));
+  check('search lists endpoints one per line', text(main, 4).split('\n').some((line) => line.startsWith('GET /pets — List pets')), text(main, 4));
+  check('endpoint lists security alternatives in spec order', text(main, 5).includes('auth: x-api-key | bearer'), text(main, 5));
   check('schema outline expands nested fields', text(main, 6).includes('owner') && text(main, 6).includes('email'), text(main, 6));
   check('destructive call needs confirm_danger', isError(main, 7) && text(main, 7).includes('confirm_danger'), text(main, 7));
   check('write without credentials names every way to supply one', isError(main, 8) && text(main, 8).includes('OPENAPI_AUTH_BEARER') && text(main, 8).includes('api_credentials'), text(main, 8));
   check('unknown scheme in `as` is refused', isError(main, 9) && text(main, 9).includes('unknown security scheme'), text(main, 9));
-  check('api_types generates the Pet type', !isError(main, 10) && (json(main, 10)?.types ?? '').includes('export type Pet'), text(main, 10));
+  check('api_types generates the Pet type', !isError(main, 10) && text(main, 10).includes('export type Pet = {'), text(main, 10));
   check('credential value never appears in output', !leaks(main.stdout, main.stderr));
+
+  const lines = (id) => text(main, id).split('\n');
+  check('search ranks a natural phrase', lines(15)[1]?.startsWith('GET /pets —'), text(main, 15));
+  check('search tolerates a typo and matches body fields', lines(16).some((line) => line.startsWith('GET /pets —') && /field .*email/.test(line)), text(main, 16));
+  check('schema scope finds a schema by its field', lines(17).some((line) => line.startsWith('Owner') && line.includes('field email')), text(main, 17));
+  check('an empty search explains how to search instead of failing', !isError(main, 18) && text(main, 18).startsWith('nothing matched "zzqx"'), text(main, 18));
+  check('an unknown schema name suggests similar ones', isError(main, 19) && text(main, 19).includes('Category'), text(main, 19));
+  const pets = text(main, 20);
+  check('endpoint shows the operation description', pets.includes('Pets in the shelter, newest first.'), pets);
+  check('endpoint shows parameter types, defaults, ranges and enums', pets.includes('limit?: integer (default 20, ..100) — Page size') && pets.includes("status?: 'available' | 'sold'"), pets);
+  check('endpoint lists errors and folds bare statuses', pets.includes('400 (body Problem)') && pets.includes('also: 401'), pets);
+  check('types use two-space indent and one-line doc comments', text(main, 10).includes('export type Pet = {\n  id: string;\n  /** Pet name */\n  name: string;'), text(main, 10));
+  check('types without docs have no comments', !isError(main, 21) && !text(main, 21).includes('/**') && text(main, 21).includes('export type Pet'), text(main, 21));
+
+  const petOutline = text(main, 11);
+  check('outline names formats instead of printing patterns', petOutline.includes('id: string (uuid)') && petOutline.includes('bornAt?: string (date-time)') && !petOutline.includes('[0-9a-fA-F]'), petOutline);
+  check('outline lists a 12-value enum in full', petOutline.includes("'k12'"), petOutline);
+  check('outline cuts long descriptions at a word', petOutline.includes('vaccination history and…'), petOutline);
+  check('outline marks a self-referencing schema as a cycle', petOutline.includes("parent?: Category (cycle → api_schema('Category'))"), petOutline);
+  check('json mode stops at a cycle', !isError(main, 12) && text(main, 12).includes('"parent":{"$ref":"Category","note":"cycle"}'), text(main, 12));
+  check('schema usage follows references between schemas', text(main, 13).startsWith('Owner · through other schemas: GET /pets'), text(main, 13));
+  const petTypes = text(main, 10);
+  check('types keep null of a nullable enum', petTypes.includes("status?: 'available' | 'sold' | null"), petTypes);
+  check('types include the components a type references', petTypes.includes('export type Owner') && petTypes.includes('export type Category'), petTypes);
+  const prefixed = text(main, 14);
+  check(
+    'name_prefix renames references but not comments',
+    prefixed.includes('owner?: XOwner') && prefixed.includes('export type XListPetsResponse = XPet[]') && prefixed.includes('Pet name') && !prefixed.includes('XPet name'),
+    prefixed
+  );
 
   const callLog = path.join(CACHE, 'live-calls.jsonl');
   const live = await run({ ...BASE_ENV, OPENAPI_BASE_URL: API, OPENAPI_AUTH_X_API_KEY: SECRET, OPENAPI_ALLOW_WRITE: 'true', OPENAPI_CALL_LOG: callLog }, [
@@ -158,6 +230,8 @@ try {
     call(8, 'api_get', { endpoint: 'GET /pets', credentials: { 'x-admin-token': CALL_SECRET } }),
     call(9, 'api_credentials', { clear: ['bearer'] }),
     call(10, 'api_request', { method: 'POST', endpoint: 'POST /pets', body: { name: 'Rex' } }),
+    call(11, 'api_get', { endpoint: 'GET /pets', fields: ['seen', 'items[].id', 'nope'], max_items: 2 }),
+    call(12, 'api_get', { endpoint: 'GET /pets', fields: ['items..id'] }),
   ]);
   const seen = (id) => json(live, id)?.body?.seen ?? {};
 
@@ -170,9 +244,40 @@ try {
   check('an unknown credential key is refused', isError(live, 8) && text(live, 8).includes('unknown credential'), text(live, 8));
   check('clear forgets a session credential', credentialOf(live, 9, 'bearer') === 'not configured' && (json(live, 9)?.forgotten ?? []).includes('bearer'), text(live, 9));
   check('after clear a write needs a credential again', isError(live, 10) && text(live, 10).includes('api_credentials'), text(live, 10));
+  const narrowed = json(live, 11);
+  check(
+    'fields and max_items narrow a response and report what they cut',
+    JSON.stringify(narrowed?.body?.items) === '[{"id":1},{"id":2}]' && narrowed?.body?.seen !== undefined && narrowed?.body?.path === undefined && narrowed?.arrays?.items === 5,
+    text(live, 11)
+  );
+  check('a field path that matches nothing is reported', JSON.stringify(narrowed?.missing) === '["nope"]', text(live, 11));
+  check('a malformed field path is refused', isError(live, 12) && text(live, 12).includes('items..id'), text(live, 12));
   const journal = existsSync(callLog) ? readFileSync(callLog, 'utf8') : '';
   check('the journal names the credential source, not the value', journal.includes('bearer (call)') && journal.includes('bearer (session)') && !leaks(journal), journal);
   check('supplied values never appear in output', !leaks(live.stdout, live.stderr));
+
+  const small = await run({ ...BASE_ENV, OPENAPI_BASE_URL: API, OPENAPI_MAX_RESPONSE_CHARS: '900' }, [init, initialized, call(2, 'api_get', { endpoint: 'GET /pets', query: { big: 1 } })]);
+  const fitted = json(small, 2);
+  check(
+    'a response over the limit gets its arrays cut instead of being truncated',
+    fitted !== null && fitted.arrays?.items === 50 && fitted.body.items.length < 50 && String(fitted.autoCapped ?? '').includes('fields'),
+    text(small, 2)
+  );
+
+  const background = await run({ OPENAPI_SPEC_URL: `${API}/spec.json`, OPENAPI_SPEC_TTL_S: '1', OPENAPI_CACHE_DIR: path.join(CACHE, 'served') }, [
+    init,
+    initialized,
+    call(2, 'api_spec_info', {}),
+    { wait: 1100, act: () => Object.assign(served, { version: '2.0.0', delayMs: 1500 }) },
+    call(3, 'api_search', { query: 'ping' }),
+    { wait: 1800 },
+    call(4, 'api_search', { query: 'ping' }),
+    call(5, 'api_search', { query: 'ping' }),
+    call(6, 'api_spec_info', { refresh: true }),
+  ]);
+  check('a stale URL spec is served at once and revalidated in the background', background.elapsed.get(3) < 800 && text(background, 3).includes('GET /ping'), `${background.elapsed.get(3)} ms: ${text(background, 3)}`);
+  check('a background update is announced once', text(background, 4).includes('the spec was updated: 1.0.0 → 2.0.0, +1') && !text(background, 5).includes('updated'), `${text(background, 4)} / ${text(background, 5)}`);
+  check('refresh waits for the source', json(background, 6)?.version === '2.0.0' && JSON.stringify(json(background, 6)?.changed?.added) === '["GET /pong"]', text(background, 6));
 
   const plainSpec = path.join(CACHE, 'plain.json');
   writeFileSync(

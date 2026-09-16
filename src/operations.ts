@@ -1,3 +1,4 @@
+import { shortDescription } from './schema-view.js';
 import type { Operation, Parameter, SchemaNode, SpecIndex } from './spec-index.js';
 
 /**
@@ -24,14 +25,15 @@ export function resolveEndpoint(index: SpecIndex, endpoint: string): Operation {
 }
 
 /**
- * Parameter names by location, with ? marking optional ones.
+ * The operation a query names exactly — a key, a path with one operation, or a unique operationId — or null.
  */
-export function paramSummary(params: Operation['params']): Record<string, string[]> {
-  return Object.fromEntries(
-    Object.entries(params)
-      .filter(([, list]) => list.length > 0)
-      .map(([where, list]) => [where, list.map((p) => `${p.name}${p.required ? '' : '?'}`)])
-  );
+export function exactOperation(index: SpecIndex, query: string): Operation | null {
+  if (/\s/.test(query.trim()) && !/^[A-Za-z]+ \//.test(query.trim())) return null;
+  try {
+    return resolveEndpoint(index, query);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -65,7 +67,10 @@ function paramType(schema: SchemaNode = {}): string {
   if (Array.isArray(schema.enum)) return schema.enum.map((v: unknown) => (typeof v === 'string' ? `'${v}'` : String(v))).join(' | ');
   if (schema.type === 'integer' || schema.type === 'number') return 'number';
   if (schema.type === 'boolean') return 'boolean';
-  if (schema.type === 'array') return `${paramType(schema.items)}[]`;
+  if (schema.type === 'array') {
+    const item = paramType(schema.items);
+    return item.includes(' | ') ? `(${item})[]` : `${item}[]`;
+  }
   return 'string';
 }
 
@@ -76,7 +81,8 @@ export function renderParams(op: Operation, name: string): string | null {
   const fields: Parameter[] = [...op.params.path, ...op.params.query];
   if (fields.length === 0) return null;
   const lines = fields.map((p) => {
-    const doc = p.description ? `  /** ${String(p.description).slice(0, 80)} */\n` : '';
+    const description = shortDescription(p.description);
+    const doc = description ? `  /** ${description.replace(/\*\//g, '* /')} */\n` : '';
     return `${doc}  ${p.name}${p.required ? '' : '?'}: ${paramType(p.schema)};`;
   });
   return `export type ${name} = {\n${lines.join('\n')}\n};`;

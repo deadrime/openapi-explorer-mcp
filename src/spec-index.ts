@@ -1,4 +1,5 @@
 import { classifyDanger, type Danger, type DangerRules } from './risk.js';
+import { buildSchemaGraph, componentRefs, type SchemaGraph } from './schema-graph.js';
 
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 // Specs are arbitrary JSON; schema nodes are walked structurally.
@@ -41,6 +42,28 @@ export interface SecurityScheme {
 }
 
 /**
+ * A documented error response.
+ */
+export interface ErrorResponse {
+  /** Status code or range, e.g. 404 or 4XX. */
+  status: string;
+  /** Description from the spec. */
+  description: string;
+  /** Component schema of the error body, when it has one. */
+  schemaName?: string;
+}
+
+/**
+ * An endpoint that references a component schema.
+ */
+export interface SchemaUse {
+  /** "METHOD /path". */
+  key: string;
+  /** Whether the operation references the schema itself rather than through another component. */
+  direct: boolean;
+}
+
+/**
  * An indexed operation.
  */
 export interface Operation {
@@ -54,6 +77,10 @@ export interface Operation {
   operationId?: string;
   /** Summary, possibly empty. */
   summary: string;
+  /** Description, possibly empty. */
+  description: string;
+  /** Whether the spec marks the operation deprecated. */
+  deprecated: boolean;
   /** Tags. */
   tags: string[];
   /** Group for browsing. */
@@ -72,12 +99,14 @@ export interface Operation {
   params: Record<'path' | 'query' | 'header' | 'cookie', Parameter[]>;
   /** JSON request body schema. */
   request?: SchemaNode;
+  /** Whether the request body is required. */
+  requestRequired: boolean;
   /** Status of the documented success response. */
   responseStatus: string | null;
   /** Success response schema. */
   response: SchemaNode | null;
-  /** Lower-cased text for search. */
-  searchText: string;
+  /** Documented 4xx and 5xx responses. */
+  errors: ErrorResponse[];
 }
 
 /**
@@ -94,10 +123,12 @@ export interface SpecIndex {
   byKey: Map<string, Operation>;
   /** Operation keys by operationId. */
   byOperationId: Map<string, string[]>;
-  /** Operation keys by the component schemas they mention. */
-  schemaUsedBy: Map<string, string[]>;
+  /** Endpoints by the component schemas they reference, direct uses first. */
+  schemaUsedBy: Map<string, SchemaUse[]>;
   /** components.schemas. */
   schemas: Record<string, SchemaNode>;
+  /** References between component schemas. */
+  graph: SchemaGraph;
   /** components.securitySchemes. */
   securitySchemes: Record<string, SecurityScheme>;
   /** servers[].url. */
@@ -128,13 +159,32 @@ function successResponse(responses: SchemaNode = {}): { status: string; schema: 
 }
 
 /**
+ * Documented 4xx and 5xx responses with their descriptions and body schema names.
+ */
+function errorResponses(responses: SchemaNode = {}): ErrorResponse[] {
+  return Object.entries<SchemaNode>(responses)
+    .filter(([status]) => /^[45](\d\d|XX)$/i.test(status))
+    .map(([status, response]) => {
+      const ref = response?.content?.['application/json']?.schema?.$ref;
+      return {
+        status: status.toUpperCase(),
+        description: typeof response?.description === 'string' ? response.description : '',
+        ...(typeof ref === 'string' ? { schemaName: ref.split('/').pop() } : {}),
+      };
+    });
+}
+
+/**
  * Builds the searchable index of a spec.
  */
 export function buildIndex(spec: OpenApiSpec, rules: DangerRules): SpecIndex {
   const operations: Operation[] = [];
   const byKey = new Map<string, Operation>();
   const byOperationId = new Map<string, string[]>();
-  const schemaUsedBy = new Map<string, string[]>();
+  const schemas: Record<string, SchemaNode> = spec.components?.schemas ?? {};
+  const graph = buildSchemaGraph(schemas);
+  const direct = new Map<string, string[]>();
+  const transitive = new Map<string, string[]>();
   const globalSecurity: SchemaNode[] | undefined = spec.security;
 
   for (const [path, item] of Object.entries<SchemaNode>(spec.paths ?? {})) {
@@ -159,6 +209,8 @@ export function buildIndex(spec: OpenApiSpec, rules: DangerRules): SpecIndex {
         path,
         operationId: op.operationId,
         summary: op.summary ?? '',
+        description: typeof op.description === 'string' ? op.description : '',
+        deprecated: op.deprecated === true,
         tags: op.tags ?? [],
         group: groupOf(path),
         admin: path.startsWith('/admin'),
@@ -168,12 +220,10 @@ export function buildIndex(spec: OpenApiSpec, rules: DangerRules): SpecIndex {
         authSchemes: [...new Set(security.flat())],
         params,
         request: op.requestBody?.content?.['application/json']?.schema,
+        requestRequired: op.requestBody?.required === true,
         responseStatus: response?.status ?? null,
         response: response?.schema ?? null,
-        searchText: [method, path, op.operationId, op.summary, (op.tags ?? []).join(' '), Object.values(params).flat().map((p) => p.name).join(' ')]
-          .filter(Boolean)
-          .join(' ')
-          .toLowerCase(),
+        errors: errorResponses(op.responses),
       };
 
       operations.push(record);
@@ -183,12 +233,18 @@ export function buildIndex(spec: OpenApiSpec, rules: DangerRules): SpecIndex {
         keys.push(key);
         byOperationId.set(op.operationId, keys);
       }
-      for (const name of new Set([...JSON.stringify(op).matchAll(/#\/components\/schemas\/([A-Za-z0-9_.-]+)/g)].map((m) => m[1]))) {
-        const keys = schemaUsedBy.get(name) ?? [];
-        keys.push(key);
-        schemaUsedBy.set(name, keys);
-      }
+      // The whole operation, parameters and error bodies included, counts as a use.
+      const own = componentRefs(op);
+      const reached = new Set<string>();
+      for (const name of own) for (const inner of graph.closure(name)) if (!own.has(inner)) reached.add(inner);
+      for (const name of own) direct.set(name, [...(direct.get(name) ?? []), key]);
+      for (const name of reached) transitive.set(name, [...(transitive.get(name) ?? []), key]);
     }
+  }
+
+  const schemaUsedBy = new Map<string, SchemaUse[]>();
+  for (const name of new Set([...direct.keys(), ...transitive.keys()])) {
+    schemaUsedBy.set(name, [...(direct.get(name) ?? []).map((key) => ({ key, direct: true })), ...(transitive.get(name) ?? []).map((key) => ({ key, direct: false }))]);
   }
 
   return {
@@ -198,7 +254,8 @@ export function buildIndex(spec: OpenApiSpec, rules: DangerRules): SpecIndex {
     byKey,
     byOperationId,
     schemaUsedBy,
-    schemas: spec.components?.schemas ?? {},
+    schemas,
+    graph,
     securitySchemes: spec.components?.securitySchemes ?? {},
     servers: ((spec.servers ?? []) as SchemaNode[]).map((s) => s.url).filter((url): url is string => typeof url === 'string'),
     counts: {
