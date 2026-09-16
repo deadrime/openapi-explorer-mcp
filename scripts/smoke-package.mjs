@@ -10,20 +10,22 @@ import path from 'node:path';
 
 const root = new URL('..', import.meta.url).pathname;
 const work = mkdtempSync(path.join(tmpdir(), 'openapi-explorer-package-'));
+// `npm publish --dry-run` hands npm_config_dry_run to its lifecycle scripts; the pack and install here must really happen.
+const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'npm_config_dry_run'));
 
 try {
-  execFileSync('npm', ['run', 'build'], { cwd: root, stdio: ['ignore', 'ignore', 'inherit'] });
+  execFileSync('npm', ['run', 'build'], { cwd: root, env, stdio: ['ignore', 'ignore', 'inherit'] });
   // Scripts are skipped so their output doesn't mix into the JSON; the build above already ran.
-  const [{ filename }] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', work], { cwd: root, encoding: 'utf8' }));
+  const [{ filename }] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', work], { cwd: root, env, encoding: 'utf8' }));
   writeFileSync(path.join(work, 'package.json'), JSON.stringify({ name: 'package-smoke', private: true }));
-  execFileSync('npm', ['install', '--no-audit', '--no-fund', path.join(work, filename)], { cwd: work, stdio: ['ignore', 'ignore', 'inherit'] });
+  execFileSync('npm', ['install', '--no-audit', '--no-fund', path.join(work, filename)], { cwd: work, env, stdio: ['ignore', 'ignore', 'inherit'] });
 
   const version = (pkg) => JSON.parse(readFileSync(path.join(work, 'node_modules', pkg, 'package.json'), 'utf8')).version;
   console.log(`installed ${filename}: typescript ${version('typescript')}, @hey-api/openapi-ts ${version('@hey-api/openapi-ts')}\n`);
 
   const result = spawnSync(process.execPath, [path.join(root, 'scripts/smoke.mjs')], {
     stdio: 'inherit',
-    env: { ...process.env, OEM_SERVER: path.join(work, 'node_modules/openapi-explorer-mcp/dist/index.js') },
+    env: { ...env, OEM_SERVER: path.join(work, 'node_modules/openapi-explorer-mcp/dist/index.js') },
   });
   process.exitCode = result.status ?? 1;
 } finally {
