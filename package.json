@@ -1,6 +1,6 @@
 {
   "name": "openapi-explorer-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for any OpenAPI 3 spec: search endpoints, inspect request and response shapes, generate TypeScript types, and call endpoints with credentials mapped to the spec's security schemes.",
   "license": "MIT",
   "author": "Eugene Trofimov",
