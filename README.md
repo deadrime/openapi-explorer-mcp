@@ -15,7 +15,7 @@ the spec and one generic caller.
 | `api_search` | Ranked search over paths, operationIds, summaries, descriptions, parameters and body fields. `scope: "schemas"` finds component schemas by name or field. |
 | `api_endpoint` | One endpoint as text: description, danger, auth alternatives, URL, typed parameters with defaults and ranges, request and response shapes (compact, depth-limited), documented errors. |
 | `api_schema` | A component schema by name, with drill-down into nested fields and the endpoints that use it, directly or through other schemas. |
-| `api_types` | TypeScript types for an endpoint's parameters, request and response, plus every type they reference, generated with `@hey-api/openapi-ts`. `docs: false` drops the comments. |
+| `api_types` | TypeScript types for an endpoint's parameters, request and response, plus every type they reference, generated with `@hey-api/openapi-ts`. The doc comment of a string field names its `format` with an `@format` tag. `docs: false` drops the comments. |
 | `api_get` | Calls a GET endpoint. `fields` and `max_items` narrow the response. |
 | `api_request` | Calls an endpoint with any method. Registered only with `OPENAPI_ALLOW_WRITE`; destructive endpoints need `confirm_danger: true`. |
 | `api_call_log` | Journal of `api_request` calls with ids from responses, for cleaning up. |

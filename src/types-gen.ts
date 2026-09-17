@@ -4,7 +4,13 @@ import path from 'node:path';
 const cache: { key: string | null; map: Map<string, string> | null } = { key: null, map: null };
 
 // Bump when the generation input or options change, so a cached types.gen.ts from an older run is not reused.
-const GENERATOR_REVISION = 'v2';
+const GENERATOR_REVISION = 'v3';
+
+// String formats the generated type already shows: a binary string becomes Blob | File.
+const TYPED_STRING_FORMATS = new Set(['binary']);
+
+// Keys whose values are data rather than schemas; a `format` inside them is not a schema format.
+const DATA_KEYS = new Set(['example', 'examples', 'default', 'enum', 'const']);
 
 /**
  * Splits types.gen.ts into declarations by name, keeping the JSDoc right above each one.
@@ -46,6 +52,29 @@ export function patchNullableEnums(node: unknown): void {
 }
 
 /**
+ * Adds an `@format` tag to the description of every string schema with a format. The generated type of such a
+ * field is plain `string`, and the generator writes doc comments only from the title and the description.
+ */
+export function patchFormatDocs(node: unknown): void {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    for (const item of node) patchFormatDocs(item);
+    return;
+  }
+  const record = node as Record<string, unknown>;
+  const { format } = record;
+  const isString = record.type === 'string' || (Array.isArray(record.type) && record.type.includes('string'));
+  if (isString && typeof format === 'string' && format && format !== 'string' && !TYPED_STRING_FORMATS.has(format)) {
+    const tag = `@format ${format}`;
+    const description = typeof record.description === 'string' ? record.description.trim() : '';
+    if (!description.split('\n').includes(tag)) record.description = description ? `${description}\n${tag}` : tag;
+  }
+  for (const [key, value] of Object.entries(record)) {
+    if (!DATA_KEYS.has(key) && !key.startsWith('x-')) patchFormatDocs(value);
+  }
+}
+
+/**
  * Returns generated declarations for a spec, regenerating only when the cache key changes.
  */
 export async function getTypeMap(specPath: string, outDir: string, cacheKey: string): Promise<Map<string, string>> {
@@ -56,7 +85,14 @@ export async function getTypeMap(specPath: string, outDir: string, cacheKey: str
   await createClient({
     input: specPath,
     output: { path: outDir, postProcess: [] },
-    parser: { patch: { input: (spec) => patchNullableEnums(spec) } },
+    parser: {
+      patch: {
+        input: (spec) => {
+          patchNullableEnums(spec);
+          patchFormatDocs(spec);
+        },
+      },
+    },
     plugins: ['@hey-api/typescript'],
     logs: { level: 'silent' },
   });

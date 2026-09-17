@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `api_types` names the `format` of a string field with an `@format` tag in its doc comment; the generated type is
+  plain `string` and lost it. `binary` is left out, its type already says it. Types cached by an earlier version are
+  regenerated.
+
 ## 0.2.0 — 2026-09-16
 
 ### Breaking

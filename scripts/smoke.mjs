@@ -209,6 +209,11 @@ try {
   check('schema usage follows references between schemas', text(main, 13).startsWith('Owner · through other schemas: GET /pets'), text(main, 13));
   const petTypes = text(main, 10);
   check('types keep null of a nullable enum', petTypes.includes("status?: 'available' | 'sold' | null"), petTypes);
+  check(
+    'types name the format of a string field in its doc comment',
+    petTypes.includes('/** @format date-time */\n  bornAt?: string;') && petTypes.includes('   * Contact email\n   * @format email\n   */\n  email?: string;'),
+    petTypes
+  );
   check('types include the components a type references', petTypes.includes('export type Owner') && petTypes.includes('export type Category'), petTypes);
   const prefixed = text(main, 14);
   check(
